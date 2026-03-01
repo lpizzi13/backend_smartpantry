@@ -43,9 +43,10 @@ def get_user_data():
                     "age": 0, "height": 0, "weight": 0, "gender": ""
                 },
                 "goals": {
-                    "dailyKcal": 0
-                },
-                "firstLogin": True
+                    "dailyKcal": 0,
+                    "fitnessGoal": "maintainance",
+                    "macrosTarget": {"carbs": 0, "protein": 0, "fat": 0}
+                }
             }
             user_ref.set(new_user_data)
             return jsonify({
@@ -63,6 +64,7 @@ def update_user():
     name = data.get('name') # <-- Recuperiamo il nome
     # Estraiamo i dati biometrici inviati da Android
     bio = data.get('biometrics') # {weight, height, age, gender, activityLevel}
+    goals = data.get('goals') # {dailyKcal, macrosTarget, fitnessGoal}
     
     if not uid or not bio:
         return jsonify({"error": "Dati incompleti"}), 400
@@ -74,6 +76,7 @@ def update_user():
         age = int(bio['age'])
         gender = bio['gender'].lower()
         activity_multiplier = float(bio.get('activityLevel', 1.2))
+        fitness_goal = goals.get('fitnessGoal', 'maintainance').lower() # 'lose', 'gain', 'maintain'
 
         # 1. Calcolo BMR (Metabolismo Basale)
         if gender == 'm' or gender == 'male':
@@ -82,7 +85,14 @@ def update_user():
             bmr = (10 * weight) + (6.25 * height) - (5 * age) - 161
 
         # 2. Calcolo TDEE (Calorie totali basate sull'attività)
-        daily_kcal = int(bmr * activity_multiplier)
+        tdee_base = int(bmr * activity_multiplier)
+
+        if fitness_goal == 'deficit':
+            daily_kcal = tdee_base - 500  # Deficit standard di 500 kcal
+        elif fitness_goal == 'surplus':
+            daily_kcal = tdee_base + 300  # Surplus moderato di 300 kcal
+        else:
+            daily_kcal = tdee_base        # Mantenimento
 
         # 3. Ripartizione Macros Standard (Esempio: 50% Carbs, 20% Prot, 30% Grassi)
         # 1g carb/prot = 4kcal, 1g grassi = 9kcal
@@ -99,9 +109,9 @@ def update_user():
             "biometrics": bio,
             "goals": {
                 "dailyKcal": daily_kcal,
-                "macrosTarget": macros
-            },
-            "firstLogin": False
+                "macrosTarget": macros,
+                "fitnessGoal": fitness_goal
+            }
         }
         
         user_ref.update(update_data)
