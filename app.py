@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, firestore, auth
+from pantries_routes import create_pantries_blueprint
 
 # 1. Inizializzazione Firebase
 cred = credentials.Certificate("serviceAccountKey.json")
@@ -8,6 +9,12 @@ firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 app = Flask(__name__)
+app.register_blueprint(create_pantries_blueprint(db))
+
+@app.route('/user/login', methods=['POST'])
+def login():
+    """Alias per /get-user-data per compatibilità con il frontend"""
+    return get_user_data()
 
 @app.route('/get-user-data', methods=['POST'])
 def get_user_data():
@@ -58,6 +65,7 @@ def get_user_data():
         return jsonify({"error": str(e)}), 500
     
 @app.route('/update-user', methods=['POST'])
+@app.route('/user/update', methods=['POST'])
 def update_user():
     data = request.json
     uid = data.get('uid')
