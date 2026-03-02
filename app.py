@@ -46,7 +46,9 @@ def get_user_data():
                     "dailyKcal": 0,
                     "fitnessGoal": "maintainance",
                     "macrosTarget": {"carbs": 0, "protein": 0, "fat": 0}
-                }
+                },
+                "profile_image_url": "",
+                "manualOverride": False
             }
             user_ref.set(new_user_data)
             return jsonify({
@@ -65,42 +67,63 @@ def update_user():
     # Estraiamo i dati biometrici inviati da Android
     bio = data.get('biometrics') # {weight, height, age, gender, activityLevel}
     goals = data.get('goals') # {dailyKcal, macrosTarget, fitnessGoal}
+    # Nuovo campo: url immagine profilo
+    profile_image_url = data.get('profile_image_url')
+    # Se true, user fornisce manualmente dailyKcal e macrosTarget
+    manual_override = bool(data.get('manualOverride', False))
     
     if not uid or not bio:
         return jsonify({"error": "Dati incompleti"}), 400
 
     try:
-        # --- LOGICA DI CALCOLO TDEE (Total Daily Energy Expenditure) ---
-        weight = float(bio['weight'])
-        height = float(bio['height'])
-        age = int(bio['age'])
-        gender = bio['gender'].lower()
-        activity_multiplier = float(bio.get('activityLevel', 1.2))
-        fitness_goal = goals.get('fitnessGoal', 'maintainance').lower() # 'lose', 'gain', 'maintain'
-
-        # 1. Calcolo BMR (Metabolismo Basale)
-        if gender == 'm' or gender == 'male':
-            bmr = (10 * weight) + (6.25 * height) - (5 * age) + 5
+        # Se l'utente richiede override manuale, usiamo i valori forniti
+        if manual_override:
+            if not goals:
+                return jsonify({"error": "manualOverride true ma 'goals' mancante"}), 400
+            try:
+                daily_kcal = int(goals.get('dailyKcal'))
+                macros = goals.get('macrosTarget') or {}
+                # Assicuriamo la presenza dei tre macro in forma numerica
+                macros = {
+                    'carbs': int(macros.get('carbs', 0)),
+                    'protein': int(macros.get('protein', 0)),
+                    'fat': int(macros.get('fat', 0))
+                }
+                fitness_goal = goals.get('fitnessGoal', 'maintainance').lower()
+            except Exception as ex:
+                return jsonify({"error": f"Goals invalidi: {str(ex)}"}), 400
         else:
-            bmr = (10 * weight) + (6.25 * height) - (5 * age) - 161
+            # --- LOGICA DI CALCOLO TDEE (Total Daily Energy Expenditure) ---
+            weight = float(bio['weight'])
+            height = float(bio['height'])
+            age = int(bio['age'])
+            gender = bio['gender'].lower()
+            activity_multiplier = float(bio.get('activityLevel', 1.2))
+            fitness_goal = (goals.get('fitnessGoal') if goals else 'maintainance').lower() # 'lose', 'gain', 'maintain'
 
-        # 2. Calcolo TDEE (Calorie totali basate sull'attività)
-        tdee_base = int(bmr * activity_multiplier)
+            # 1. Calcolo BMR (Metabolismo Basale)
+            if gender == 'm' or gender == 'male':
+                bmr = (10 * weight) + (6.25 * height) - (5 * age) + 5
+            else:
+                bmr = (10 * weight) + (6.25 * height) - (5 * age) - 161
 
-        if fitness_goal == 'deficit':
-            daily_kcal = tdee_base - 500  # Deficit standard di 500 kcal
-        elif fitness_goal == 'surplus':
-            daily_kcal = tdee_base + 300  # Surplus moderato di 300 kcal
-        else:
-            daily_kcal = tdee_base        # Mantenimento
+            # 2. Calcolo TDEE (Calorie totali basate sull'attività)
+            tdee_base = int(bmr * activity_multiplier)
 
-        # 3. Ripartizione Macros Standard (Esempio: 50% Carbs, 20% Prot, 30% Grassi)
-        # 1g carb/prot = 4kcal, 1g grassi = 9kcal
-        macros = {
-            "carbs": int((daily_kcal * 0.50) / 4),
-            "protein": int((daily_kcal * 0.20) / 4),
-            "fat": int((daily_kcal * 0.30) / 9)
-        }
+            if fitness_goal == 'deficit':
+                daily_kcal = tdee_base - 500  # Deficit standard di 500 kcal
+            elif fitness_goal == 'surplus':
+                daily_kcal = tdee_base + 300  # Surplus moderato di 300 kcal
+            else:
+                daily_kcal = tdee_base        # Mantenimento
+
+            # 3. Ripartizione Macros Standard (Esempio: 50% Carbs, 20% Prot, 30% Grassi)
+            # 1g carb/prot = 4kcal, 1g grassi = 9kcal
+            macros = {
+                "carbs": int((daily_kcal * 0.50) / 4),
+                "protein": int((daily_kcal * 0.20) / 4),
+                "fat": int((daily_kcal * 0.30) / 9)
+            }
 
         # --- AGGIORNAMENTO FIRESTORE ---
         user_ref = db.collection('users').document(uid)
@@ -113,6 +136,11 @@ def update_user():
                 "fitnessGoal": fitness_goal
             }
         }
+        # Salviamo lo stato di manualOverride nel documento utente
+        update_data['manualOverride'] = manual_override
+        # Se fornita, aggiungiamo l'URL dell'immagine profilo
+        if profile_image_url:
+            update_data['profile_image_url'] = profile_image_url
         
         user_ref.update(update_data)
 
