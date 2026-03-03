@@ -17,7 +17,7 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
         lang = request.args.get("lang", "it")
         try:
             similar = _parse_bool_query_param(
-                request.args.get("similar", "false"), "similar"
+                request.args.get("similar", "true"), "similar"
             )
             search_payload = pantries_service.search_products(
                 query=query,
@@ -75,13 +75,31 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
     def add_item() -> Tuple[Any, int]:
         payload = _get_json_payload()
         try:
-            result = pantries_service.add_or_upsert_item(
-                uid=payload.get("uid"),
-                open_food_facts_id=payload.get("openFoodFactsId"),
-                quantity_delta=payload.get("quantityDelta"),
-                product_name=payload.get("productName"),
-                nutrients=payload.get("nutrients"),
-            )
+            quantity = payload.get("quantity")
+            quantity_delta = payload.get("quantityDelta")
+            if quantity is not None and quantity_delta is not None:
+                raise PantriesError(
+                    "Usa quantity oppure quantityDelta, non entrambi",
+                    status_code=400,
+                )
+
+            if quantity is not None:
+                result = pantries_service.set_item_quantity(
+                    uid=payload.get("uid"),
+                    open_food_facts_id=payload.get("openFoodFactsId"),
+                    quantity=quantity,
+                    product_name=payload.get("productName"),
+                    nutrients=payload.get("nutrients"),
+                    allow_zero=False,
+                )
+            else:
+                result = pantries_service.add_or_upsert_item(
+                    uid=payload.get("uid"),
+                    open_food_facts_id=payload.get("openFoodFactsId"),
+                    quantity_delta=quantity_delta,
+                    product_name=payload.get("productName"),
+                    nutrients=payload.get("nutrients"),
+                )
             status_code = 201 if result.get("created") else 200
             item_payload = {
                 "openFoodFactsId": result["openFoodFactsId"],
@@ -90,6 +108,30 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
             }
             if result.get("nutrients"):
                 item_payload["nutrients"] = result["nutrients"]
+            return (jsonify({"status": "success", "item": item_payload}), status_code)
+        except Exception as exc:
+            return _handle_error(exc)
+
+    @pantries_bp.route("/pantry/quantity", methods=["PATCH"])
+    def set_item_quantity() -> Tuple[Any, int]:
+        payload = _get_json_payload()
+        try:
+            result = pantries_service.set_item_quantity(
+                uid=payload.get("uid"),
+                open_food_facts_id=payload.get("openFoodFactsId"),
+                quantity=payload.get("quantity"),
+                product_name=payload.get("productName"),
+                nutrients=payload.get("nutrients"),
+            )
+            item_payload = {
+                "openFoodFactsId": result["openFoodFactsId"],
+                "productName": result["productName"],
+                "quantity": result["quantity"],
+                "deleted": bool(result.get("deleted")),
+            }
+            if result.get("nutrients"):
+                item_payload["nutrients"] = result["nutrients"]
+            status_code = 201 if result.get("created") else 200
             return (jsonify({"status": "success", "item": item_payload}), status_code)
         except Exception as exc:
             return _handle_error(exc)

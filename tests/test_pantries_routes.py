@@ -243,6 +243,78 @@ class PantriesRoutesTests(unittest.TestCase):
             },
         )
 
+    def test_add_with_explicit_quantity_creates_item(self):
+        response = self.client.post(
+            "/pantry/add",
+            json={
+                "uid": "uid-1b",
+                "openFoodFactsId": "off-010",
+                "productName": "Riso",
+                "quantity": 4,
+            },
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(
+            response.get_json(),
+            {
+                "status": "success",
+                "item": {
+                    "openFoodFactsId": "off-010",
+                    "productName": "Riso",
+                    "quantity": 4,
+                },
+            },
+        )
+
+        item_doc = self.db.get_document("users", "uid-1b", "pantry", "off-010")
+        self.assertIsNotNone(item_doc)
+        self.assertEqual(item_doc["quantity"], 4)
+
+    def test_update_quantity_of_existing_item(self):
+        self._add("uid-1c", "off-011", 2, "Pasta")
+        response = self.client.patch(
+            "/pantry/quantity",
+            json={"uid": "uid-1c", "openFoodFactsId": "off-011", "quantity": 7},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json(),
+            {
+                "status": "success",
+                "item": {
+                    "openFoodFactsId": "off-011",
+                    "productName": "Pasta",
+                    "quantity": 7,
+                    "deleted": False,
+                },
+            },
+        )
+
+        item_doc = self.db.get_document("users", "uid-1c", "pantry", "off-011")
+        self.assertIsNotNone(item_doc)
+        self.assertEqual(item_doc["quantity"], 7)
+
+    def test_update_quantity_to_zero_deletes_item(self):
+        self._add("uid-1d", "off-012", 2, "Latte")
+        response = self.client.patch(
+            "/pantry/quantity",
+            json={"uid": "uid-1d", "openFoodFactsId": "off-012", "quantity": 0},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json(),
+            {
+                "status": "success",
+                "item": {
+                    "openFoodFactsId": "off-012",
+                    "productName": "Latte",
+                    "quantity": 0,
+                    "deleted": True,
+                },
+            },
+        )
+        self.assertIsNone(self.db.get_document("users", "uid-1d", "pantry", "off-012"))
+
     def test_decrement_and_delete(self):
         self._add("uid-2", "off-009", 2, "Latte")
 
@@ -331,6 +403,18 @@ class PantriesRoutesTests(unittest.TestCase):
             },
         )
 
+    @patch("pantries_service.requests.get")
+    def test_search_and_add_do_not_persist_product_catalog(self, mock_get):
+        self._add("uid-4b", "off-xyz", 1, "Yogurt")
+        mock_get.return_value = FakeOffResponse(self._off_products_payload())
+        response = self.client.get("/pantry/search?q=pasta&lang=it")
+        self.assertEqual(response.status_code, 200)
+
+        has_product_catalog_docs = any(
+            "product_catalog" in path for path in self.db._documents.keys()
+        )
+        self.assertFalse(has_product_catalog_docs)
+
     def test_validation_errors(self):
         missing_uid = self.client.post(
             "/pantry/add",
@@ -353,6 +437,44 @@ class PantriesRoutesTests(unittest.TestCase):
                 "status": "error",
                 "error": "quantityDelta deve essere un intero >= 1",
             },
+        )
+
+        invalid_quantity_set = self.client.patch(
+            "/pantry/quantity",
+            json={"uid": "uid-5", "openFoodFactsId": "off-001", "quantity": -1},
+        )
+        self.assertEqual(invalid_quantity_set.status_code, 400)
+        self.assertEqual(
+            invalid_quantity_set.get_json(),
+            {"status": "error", "error": "quantity deve essere un intero >= 0"},
+        )
+
+        ambiguous_add_payload = self.client.post(
+            "/pantry/add",
+            json={
+                "uid": "uid-5",
+                "openFoodFactsId": "off-001",
+                "quantity": 2,
+                "quantityDelta": 1,
+            },
+        )
+        self.assertEqual(ambiguous_add_payload.status_code, 400)
+        self.assertEqual(
+            ambiguous_add_payload.get_json(),
+            {
+                "status": "error",
+                "error": "Usa quantity oppure quantityDelta, non entrambi",
+            },
+        )
+
+        add_with_zero_quantity = self.client.post(
+            "/pantry/add",
+            json={"uid": "uid-5", "openFoodFactsId": "off-001", "quantity": 0},
+        )
+        self.assertEqual(add_with_zero_quantity.status_code, 400)
+        self.assertEqual(
+            add_with_zero_quantity.get_json(),
+            {"status": "error", "error": "quantity deve essere un intero >= 1"},
         )
 
     def test_search_validation_errors(self):
@@ -385,7 +507,7 @@ class PantriesRoutesTests(unittest.TestCase):
         )
 
     @patch("pantries_service.requests.get")
-    def test_search_without_similar_returns_products_and_empty_recommended(
+    def test_search_without_similar_returns_products_and_ranked_recommended(
         self, mock_get
     ):
         mock_get.return_value = FakeOffResponse(self._off_products_payload())
@@ -394,7 +516,9 @@ class PantriesRoutesTests(unittest.TestCase):
         payload = response.get_json()
 
         self.assertEqual(payload["query"], "pasta")
-        self.assertEqual(payload["recommended"], [])
+        self.assertEqual(len(payload["recommended"]), 3)
+        self.assertEqual(payload["recommended"][0]["code"], "111")
+        self.assertEqual(payload["recommended"][1]["code"], "333")
         self.assertEqual(
             payload["products"],
             [

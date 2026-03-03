@@ -1,3 +1,4 @@
+from collections import OrderedDict
 import re
 import time
 import unicodedata
@@ -17,11 +18,20 @@ MIN_SEARCH_QUERY_LENGTH = 2
 OFF_MAX_RETRIES = 2
 OFF_RETRY_BACKOFF_SECONDS = 0.2
 OFF_RETRYABLE_HTTP_STATUS = {429, 500, 502, 503, 504}
-OFF_SEARCH_TIMEOUT: Tuple[float, float] = (1.0, 3.0)
+OFF_SEARCH_TIMEOUT: Tuple[float, float] = (2.0, 8.0)
+OFF_LEGACY_SEARCH_TIMEOUT: Tuple[float, float] = (3.05, 15.0)
 OFF_BARCODE_TIMEOUT: Tuple[float, float] = (3.05, 8.0)
 OFF_SEARCH_MAX_RETRIES = 1
 OFF_BARCODE_MAX_RETRIES = OFF_MAX_RETRIES
+OFF_SEARCH_URL = "https://search.openfoodfacts.org/search"
+OFF_LEGACY_SEARCH_URL = "https://world.openfoodfacts.org/cgi/search.pl"
+OFF_DEFAULT_HEADERS = {
+    "User-Agent": "SmartPantryBackend/1.0 (smartpantry@localhost)",
+    "Accept": "application/json",
+}
 FALLBACK_FIRESTORE_SCAN_LIMIT = 800
+SEARCH_CACHE_MAX_ENTRIES = 3000
+SEARCH_CACHE_TTL_SECONDS = 60 * 60 * 24
 
 
 class PantriesError(Exception):
@@ -34,6 +44,8 @@ class PantriesError(Exception):
 class PantriesService:
     def __init__(self, db: Any):
         self._db = db
+        # Volatile LRU+TTL cache for recent product lookups.
+        self._search_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
     def search_products(
         self,
@@ -88,30 +100,69 @@ class PantriesService:
         limit: int = DEFAULT_SEARCH_LIMIT,
         lang: str = "it",
     ) -> List[Dict[str, Any]]:
-        url = "https://world.openfoodfacts.org/cgi/search.pl"
         page_size = min(max(limit, 20), MAX_SEARCH_LIMIT)
-        params = {
-            "search_terms": query,
-            "search_simple": 1,
-            "action": "process",
-            "json": 1,
-            "page_size": page_size,
-            "lc": lang,
-        }
-
-        data = self._off_get_json(
-            url=url,
-            params=params,
-            timeout=OFF_SEARCH_TIMEOUT,
-            max_retries=OFF_SEARCH_MAX_RETRIES,
+        search_fields = ",".join(
+            [
+                "code",
+                "product_name",
+                f"product_name_{lang}",
+                "generic_name",
+                f"generic_name_{lang}",
+                "brands",
+                "brands_tags",
+            ]
         )
-        products = data.get("products", [])
-        normalized_products = [
-            self._map_off_search_product(product=p, preferred_lang=lang)
-            for p in products
+        search_backends = [
+            {
+                "url": OFF_SEARCH_URL,
+                "params": {
+                    "q": query,
+                    "page_size": page_size,
+                    "fields": search_fields,
+                },
+                "timeout": OFF_SEARCH_TIMEOUT,
+            },
+            {
+                "url": OFF_LEGACY_SEARCH_URL,
+                "params": {
+                    "search_terms": query,
+                    "search_simple": 1,
+                    "action": "process",
+                    "json": 1,
+                    "page_size": page_size,
+                    "lc": lang,
+                },
+                "timeout": OFF_LEGACY_SEARCH_TIMEOUT,
+            },
         ]
-        self._cache_off_search_products(products, preferred_lang=lang)
-        return normalized_products
+
+        last_exception: Optional[PantriesError] = None
+        for backend in search_backends:
+            try:
+                data = self._off_get_json(
+                    url=backend["url"],
+                    params=backend["params"],
+                    timeout=backend["timeout"],
+                    max_retries=OFF_SEARCH_MAX_RETRIES,
+                )
+            except PantriesError as exc:
+                last_exception = exc
+                continue
+
+            products = self._extract_off_search_products(data)
+            if not products:
+                continue
+
+            normalized_products = [
+                self._map_off_search_product(product=p, preferred_lang=lang)
+                for p in products
+            ]
+            self._cache_off_search_products(products, preferred_lang=lang)
+            return normalized_products
+
+        if last_exception is not None:
+            raise last_exception
+        return []
 
     def get_open_food_facts_product(self, barcode: str) -> Dict[str, Any]:
         normalized_barcode = self._normalize_barcode(barcode)
@@ -219,6 +270,106 @@ class PantriesService:
             product_name=result["productName"],
             nutrients=result.get("nutrients") or validated_nutrients or cached_nutrients,
         )
+        return result
+
+    def set_item_quantity(
+        self,
+        uid: Any,
+        open_food_facts_id: Any,
+        quantity: Any,
+        product_name: Any = None,
+        nutrients: Any = None,
+        allow_zero: bool = True,
+    ) -> Dict[str, Any]:
+        validated_uid = self._validate_uid(uid)
+        validated_id = self._validate_open_food_facts_id(open_food_facts_id)
+        validated_quantity = self._validate_non_negative_int(quantity, "quantity")
+        if not allow_zero and validated_quantity == 0:
+            raise PantriesError("quantity deve essere un intero >= 1", status_code=400)
+        validated_product_name = self._validate_product_name(product_name)
+        validated_nutrients = self._validate_nutrients(nutrients)
+        should_update_product_name = bool(validated_product_name)
+        should_update_nutrients = bool(validated_nutrients)
+        cached_entry = self._get_cached_product_entry(validated_id)
+        cached_name = self._normalize_text(cached_entry.get("product_name"))
+        cached_nutrients = self._validate_nutrients(cached_entry.get("nutrients"))
+
+        item_ref = self._get_pantry_collection(validated_uid).document(validated_id)
+
+        def _tx(transaction: Any) -> Dict[str, Any]:
+            snapshot = item_ref.get(transaction=transaction)
+            exists = snapshot.exists
+            current_product_name = self._normalize_stored_product_name(
+                snapshot.get("productName")
+            )
+            current_nutrients = self._validate_nutrients(snapshot.get("nutrients"))
+
+            final_product_name = (
+                validated_product_name
+                or current_product_name
+                or cached_name
+                or "Prodotto sconosciuto"
+            )
+            final_nutrients = validated_nutrients or current_nutrients or cached_nutrients
+
+            if validated_quantity == 0:
+                if exists:
+                    transaction.delete(item_ref)
+                return {
+                    "openFoodFactsId": validated_id,
+                    "productName": final_product_name,
+                    "quantity": 0,
+                    "nutrients": final_nutrients,
+                    "created": False,
+                    "deleted": exists,
+                }
+
+            if not exists:
+                create_payload = {
+                    "openFoodFactsId": validated_id,
+                    "productName": final_product_name,
+                    "quantity": validated_quantity,
+                    "lastUpdated": SERVER_TIMESTAMP,
+                }
+                if final_nutrients:
+                    create_payload["nutrients"] = final_nutrients
+                transaction.set(item_ref, create_payload)
+                return {
+                    "openFoodFactsId": validated_id,
+                    "productName": final_product_name,
+                    "quantity": validated_quantity,
+                    "nutrients": final_nutrients,
+                    "created": True,
+                    "deleted": False,
+                }
+
+            update_payload = {
+                "quantity": validated_quantity,
+                "lastUpdated": SERVER_TIMESTAMP,
+            }
+            if should_update_product_name:
+                update_payload["productName"] = validated_product_name
+                final_product_name = validated_product_name
+            if should_update_nutrients:
+                update_payload["nutrients"] = validated_nutrients
+                final_nutrients = validated_nutrients
+            transaction.update(item_ref, update_payload)
+            return {
+                "openFoodFactsId": validated_id,
+                "productName": final_product_name,
+                "quantity": validated_quantity,
+                "nutrients": final_nutrients,
+                "created": False,
+                "deleted": False,
+            }
+
+        result = self._run_transaction(_tx)
+        if result.get("quantity", 0) > 0:
+            self._upsert_search_cache_entry(
+                open_food_facts_id=result["openFoodFactsId"],
+                product_name=result["productName"],
+                nutrients=result.get("nutrients") or validated_nutrients or cached_nutrients,
+            )
         return result
 
     def decrement_item(self, uid: Any, open_food_facts_id: Any) -> Dict[str, Any]:
@@ -357,29 +508,13 @@ class PantriesService:
     def search_firestore_products(self, query: str, limit: int) -> List[Dict[str, Any]]:
         by_code: Dict[str, Dict[str, Any]] = {}
 
-        # 1) Search persistent catalog built by backend on each /pantry/add.
-        collection = getattr(self._db, "collection", None)
-        if callable(collection):
-            try:
-                cached_docs = (
-                    collection("product_catalog")
-                    .limit(FALLBACK_FIRESTORE_SCAN_LIMIT)
-                    .stream()
-                )
-                for doc in cached_docs:
-                    data = doc.to_dict() or {}
-                    code = self._normalize_text(data.get("code")) or self._normalize_text(
-                        getattr(doc, "id", "")
-                    )
-                    if not code:
-                        continue
-                    by_code[code] = {
-                        "code": code,
-                        "product_name": self._normalize_text(data.get("product_name")),
-                        "brands": self._normalize_text(data.get("brands")),
-                    }
-            except Exception:
-                pass
+        # 1) Search recent OFF lookups cached in memory (no Firestore persistence).
+        for code, data in self._iter_cached_search_entries():
+            by_code[code] = {
+                "code": code,
+                "product_name": self._normalize_text(data.get("product_name")),
+                "brands": self._normalize_text(data.get("brands")),
+            }
 
         # 2) Fallback to live pantry documents.
         collection_group = getattr(self._db, "collection_group", None)
@@ -455,6 +590,14 @@ class PantriesService:
                 nutrients=self._extract_off_nutrients(product),
             )
 
+    @staticmethod
+    def _extract_off_search_products(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        for key in ("hits", "products"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return []
+
     def _upsert_search_cache_entry(
         self,
         open_food_facts_id: str,
@@ -462,27 +605,52 @@ class PantriesService:
         brands: str = "",
         nutrients: Optional[Dict[str, float]] = None,
     ) -> None:
-        collection = getattr(self._db, "collection", None)
-        if not callable(collection):
-            return
-
         normalized_code = self._normalize_text(open_food_facts_id)
         if not normalized_code:
             return
 
-        payload = {
-            "code": normalized_code,
+        try:
+            normalized_nutrients = self._validate_nutrients(nutrients)
+        except PantriesError:
+            normalized_nutrients = {}
+
+        self._cleanup_expired_search_cache()
+        if normalized_code in self._search_cache:
+            self._search_cache.pop(normalized_code, None)
+
+        payload: Dict[str, Any] = {
             "product_name": self._normalize_text(product_name),
             "brands": self._normalize_text(brands),
-            "lastUpdated": SERVER_TIMESTAMP,
+            "expires_at": time.time() + SEARCH_CACHE_TTL_SECONDS,
         }
-        if nutrients:
-            payload["nutrients"] = nutrients
+        if normalized_nutrients:
+            payload["nutrients"] = normalized_nutrients
 
+        self._search_cache[normalized_code] = payload
         try:
-            collection("product_catalog").document(normalized_code).set(payload, merge=True)
+            while len(self._search_cache) > SEARCH_CACHE_MAX_ENTRIES:
+                self._search_cache.popitem(last=False)
         except Exception:
             return
+
+    def _iter_cached_search_entries(self) -> List[Tuple[str, Dict[str, Any]]]:
+        self._cleanup_expired_search_cache()
+        entries: List[Tuple[str, Dict[str, Any]]] = []
+        for code, data in self._search_cache.items():
+            entries.append((code, dict(data)))
+        return entries
+
+    def _cleanup_expired_search_cache(self) -> None:
+        if not self._search_cache:
+            return
+        now = time.time()
+        expired_codes = [
+            code
+            for code, data in self._search_cache.items()
+            if float(data.get("expires_at", 0)) <= now
+        ]
+        for code in expired_codes:
+            self._search_cache.pop(code, None)
 
     def _build_recommended_products(
         self, query: str, products: List[Dict[str, Any]], limit: int
@@ -560,12 +728,21 @@ class PantriesService:
         params: Optional[Dict[str, Any]],
         timeout: Tuple[float, float],
         max_retries: int = OFF_MAX_RETRIES,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         last_exception: Optional[Exception] = None
 
         for attempt in range(max_retries + 1):
             try:
-                response = requests.get(url, params=params, timeout=timeout)
+                request_headers = dict(OFF_DEFAULT_HEADERS)
+                if headers:
+                    request_headers.update(headers)
+                response = requests.get(
+                    url,
+                    params=params,
+                    timeout=timeout,
+                    headers=request_headers,
+                )
                 if response.status_code in OFF_RETRYABLE_HTTP_STATUS:
                     raise requests.HTTPError(
                         f"OFF temporary HTTP {response.status_code}",
@@ -651,6 +828,13 @@ class PantriesService:
 
     @staticmethod
     def _extract_off_brands(product: Dict[str, Any]) -> str:
+        brands = product.get("brands")
+        if isinstance(brands, list):
+            cleaned = [PantriesService._normalize_text(brand) for brand in brands]
+            normalized = [value for value in cleaned if value]
+            if normalized:
+                return ", ".join(normalized)
+
         direct = PantriesService._normalize_text(product.get("brands"))
         if direct:
             return direct
@@ -714,18 +898,29 @@ class PantriesService:
         return nutrients
 
     def _get_cached_product_entry(self, open_food_facts_id: str) -> Dict[str, Any]:
-        collection = getattr(self._db, "collection", None)
-        if not callable(collection):
+        normalized_code = self._normalize_text(open_food_facts_id)
+        if not normalized_code:
             return {}
-        try:
-            snapshot = collection("product_catalog").document(open_food_facts_id).get()
-            if getattr(snapshot, "exists", False):
-                data = snapshot.to_dict()
-                if isinstance(data, dict):
-                    return data
+
+        self._cleanup_expired_search_cache()
+        entry = self._search_cache.get(normalized_code)
+        if not isinstance(entry, dict):
             return {}
-        except Exception:
+
+        if float(entry.get("expires_at", 0)) <= time.time():
+            self._search_cache.pop(normalized_code, None)
             return {}
+
+        self._search_cache.move_to_end(normalized_code)
+        payload = {
+            "code": normalized_code,
+            "product_name": self._normalize_text(entry.get("product_name")),
+            "brands": self._normalize_text(entry.get("brands")),
+        }
+        nutrients = entry.get("nutrients")
+        if isinstance(nutrients, dict) and nutrients:
+            payload["nutrients"] = dict(nutrients)
+        return payload
 
     @staticmethod
     def _normalize_barcode(barcode: Any) -> str:
@@ -776,6 +971,27 @@ class PantriesService:
         if parsed < 1:
             raise PantriesError(
                 f"{field_name} deve essere un intero >= 1", status_code=400
+            )
+
+        return parsed
+
+    @staticmethod
+    def _validate_non_negative_int(value: Any, field_name: str) -> int:
+        if isinstance(value, bool):
+            raise PantriesError(
+                f"{field_name} deve essere un intero >= 0", status_code=400
+            )
+
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise PantriesError(
+                f"{field_name} deve essere un intero >= 0", status_code=400
+            ) from exc
+
+        if parsed < 0:
+            raise PantriesError(
+                f"{field_name} deve essere un intero >= 0", status_code=400
             )
 
         return parsed
