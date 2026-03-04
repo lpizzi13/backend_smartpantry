@@ -1,4 +1,5 @@
 from collections import OrderedDict
+import math
 import re
 import time
 import unicodedata
@@ -110,6 +111,10 @@ class PantriesService:
                 f"generic_name_{lang}",
                 "brands",
                 "brands_tags",
+                # Package weight metadata.
+                "quantity",
+                "product_quantity",
+                "product_quantity_unit",
                 # Needed to prefill macros on frontend search results.
                 "nutriments",
                 "energy-kcal_100g",
@@ -191,6 +196,7 @@ class PantriesService:
             product_name=mapped_product.get("productName", ""),
             brands=mapped_product.get("brands", ""),
             nutrients=mapped_product.get("nutrients") or {},
+            package_weight_grams=mapped_product.get("packageWeightGrams"),
         )
         return mapped_product
 
@@ -201,21 +207,29 @@ class PantriesService:
         quantity_delta: Any,
         product_name: Any = None,
         nutrients: Any = None,
+        package_weight_grams: Any = None,
     ) -> Dict[str, Any]:
         validated_uid = self._validate_uid(uid)
         validated_delta = self._validate_positive_int(quantity_delta, "quantityDelta")
         validated_product_name = self._validate_product_name(product_name)
         validated_nutrients = self._validate_nutrients(nutrients)
+        validated_package_weight_grams = self._validate_package_weight_grams(
+            package_weight_grams
+        )
         validated_id, item_source, requested_food_name = self._resolve_item_identity(
             open_food_facts_id=open_food_facts_id,
             product_name=validated_product_name,
         )
         should_update_product_name = bool(validated_product_name)
         should_update_nutrients = bool(validated_nutrients)
+        should_update_package_weight = package_weight_grams is not None
         cached_entry = self._get_cached_product_entry(validated_id)
         cached_name = self._normalize_text(cached_entry.get("product_name"))
         cached_nutrients = self._to_complete_nutrients(
             self._validate_nutrients(cached_entry.get("nutrients"))
+        )
+        cached_package_weight = self._validate_package_weight_grams(
+            cached_entry.get("package_weight_grams")
         )
 
         # Riferimento: users/{uid}/pantry/{itemId}
@@ -240,6 +254,11 @@ class PantriesService:
                 final_nutrients = self._to_complete_nutrients(
                     validated_nutrients or cached_nutrients
                 )
+                final_package_weight = (
+                    validated_package_weight_grams
+                    if should_update_package_weight
+                    else cached_package_weight
+                )
                 final_food_name = self._resolve_food_name(
                     source=item_source,
                     open_food_facts_id=validated_id,
@@ -256,6 +275,9 @@ class PantriesService:
                     "lastUpdated": SERVER_TIMESTAMP,
                 }
                 create_payload.update(self._build_nutrients_storage(final_nutrients))
+                create_payload.update(
+                    self._build_package_weight_storage(final_package_weight)
+                )
                 transaction.set(
                     item_ref,
                     create_payload,
@@ -283,11 +305,19 @@ class PantriesService:
                 final_product_name = current_product_name or "Prodotto sconosciuto"
                 current_nutrients = self._extract_stored_nutrients(snapshot_data)
                 final_nutrients = current_nutrients
+                current_package_weight = self._extract_stored_package_weight_grams(
+                    snapshot_data
+                )
+                final_package_weight = current_package_weight
                 if should_update_product_name:
                     update_payload["productName"] = validated_product_name
                     final_product_name = validated_product_name
                 if should_update_nutrients:
                     final_nutrients = self._to_complete_nutrients(validated_nutrients)
+                if should_update_package_weight:
+                    final_package_weight = validated_package_weight_grams
+                elif final_package_weight is None:
+                    final_package_weight = cached_package_weight
                 final_food_name = self._resolve_food_name(
                     source=current_source,
                     open_food_facts_id=validated_id,
@@ -297,25 +327,32 @@ class PantriesService:
                 )
                 update_payload["foodName"] = final_food_name
                 update_payload.update(self._build_nutrients_storage(final_nutrients))
+                update_payload.update(
+                    self._build_package_weight_storage(final_package_weight)
+                )
                 update_payload.update(self._build_legacy_nutrients_cleanup())
                 transaction.update(
                     item_ref,
                     update_payload,
                 )
 
-            return {
+            result_payload = {
                 "openFoodFactsId": validated_id,
                 "productName": final_product_name,
                 "quantity": new_quantity,
                 "nutrients": final_nutrients,
                 "created": created,
             }
+            if final_package_weight is not None:
+                result_payload["packageWeightGrams"] = final_package_weight
+            return result_payload
 
         result = self._run_transaction(_tx)
         self._upsert_search_cache_entry(
             open_food_facts_id=result["openFoodFactsId"],
             product_name=result["productName"],
             nutrients=result.get("nutrients") or validated_nutrients or cached_nutrients,
+            package_weight_grams=result.get("packageWeightGrams"),
         )
         return result
 
@@ -326,6 +363,7 @@ class PantriesService:
         quantity: Any,
         product_name: Any = None,
         nutrients: Any = None,
+        package_weight_grams: Any = None,
         allow_zero: bool = True,
     ) -> Dict[str, Any]:
         validated_uid = self._validate_uid(uid)
@@ -338,12 +376,19 @@ class PantriesService:
         if not allow_zero and validated_quantity == 0:
             raise PantriesError("quantity deve essere un intero >= 1", status_code=400)
         validated_nutrients = self._validate_nutrients(nutrients)
+        validated_package_weight_grams = self._validate_package_weight_grams(
+            package_weight_grams
+        )
         should_update_product_name = bool(validated_product_name)
         should_update_nutrients = bool(validated_nutrients)
+        should_update_package_weight = package_weight_grams is not None
         cached_entry = self._get_cached_product_entry(validated_id)
         cached_name = self._normalize_text(cached_entry.get("product_name"))
         cached_nutrients = self._to_complete_nutrients(
             self._validate_nutrients(cached_entry.get("nutrients"))
+        )
+        cached_package_weight = self._validate_package_weight_grams(
+            cached_entry.get("package_weight_grams")
         )
 
         item_ref = self._get_pantry_collection(validated_uid).document(validated_id)
@@ -363,6 +408,9 @@ class PantriesService:
                 validated_id,
             )
             current_nutrients = self._extract_stored_nutrients(snapshot_data)
+            current_package_weight = self._extract_stored_package_weight_grams(
+                snapshot_data
+            )
 
             final_product_name = (
                 validated_product_name
@@ -372,6 +420,15 @@ class PantriesService:
             )
             final_nutrients = self._to_complete_nutrients(
                 validated_nutrients or current_nutrients or cached_nutrients
+            )
+            final_package_weight = (
+                validated_package_weight_grams
+                if should_update_package_weight
+                else (
+                    current_package_weight
+                    if current_package_weight is not None
+                    else cached_package_weight
+                )
             )
             final_source = current_source if exists else item_source
             final_food_name = self._resolve_food_name(
@@ -385,7 +442,7 @@ class PantriesService:
             if validated_quantity == 0:
                 if exists:
                     transaction.delete(item_ref)
-                return {
+                deleted_payload = {
                     "openFoodFactsId": validated_id,
                     "productName": final_product_name,
                     "quantity": 0,
@@ -393,6 +450,9 @@ class PantriesService:
                     "created": False,
                     "deleted": exists,
                 }
+                if final_package_weight is not None:
+                    deleted_payload["packageWeightGrams"] = final_package_weight
+                return deleted_payload
 
             if not exists:
                 create_payload = {
@@ -404,8 +464,11 @@ class PantriesService:
                     "lastUpdated": SERVER_TIMESTAMP,
                 }
                 create_payload.update(self._build_nutrients_storage(final_nutrients))
+                create_payload.update(
+                    self._build_package_weight_storage(final_package_weight)
+                )
                 transaction.set(item_ref, create_payload)
-                return {
+                created_payload = {
                     "openFoodFactsId": validated_id,
                     "productName": final_product_name,
                     "quantity": validated_quantity,
@@ -413,6 +476,9 @@ class PantriesService:
                     "created": True,
                     "deleted": False,
                 }
+                if final_package_weight is not None:
+                    created_payload["packageWeightGrams"] = final_package_weight
+                return created_payload
 
             update_payload = {
                 "quantity": validated_quantity,
@@ -426,9 +492,12 @@ class PantriesService:
             if should_update_nutrients:
                 final_nutrients = self._to_complete_nutrients(validated_nutrients)
             update_payload.update(self._build_nutrients_storage(final_nutrients))
+            update_payload.update(
+                self._build_package_weight_storage(final_package_weight)
+            )
             update_payload.update(self._build_legacy_nutrients_cleanup())
             transaction.update(item_ref, update_payload)
-            return {
+            updated_payload = {
                 "openFoodFactsId": validated_id,
                 "productName": final_product_name,
                 "quantity": validated_quantity,
@@ -436,6 +505,9 @@ class PantriesService:
                 "created": False,
                 "deleted": False,
             }
+            if final_package_weight is not None:
+                updated_payload["packageWeightGrams"] = final_package_weight
+            return updated_payload
 
         result = self._run_transaction(_tx)
         if result.get("quantity", 0) > 0:
@@ -443,6 +515,7 @@ class PantriesService:
                 open_food_facts_id=result["openFoodFactsId"],
                 product_name=result["productName"],
                 nutrients=result.get("nutrients") or validated_nutrients or cached_nutrients,
+                package_weight_grams=result.get("packageWeightGrams"),
             )
         return result
 
@@ -453,6 +526,7 @@ class PantriesService:
         quantity: Any = None,
         product_name: Any = None,
         nutrients: Any = None,
+        package_weight_grams: Any = None,
     ) -> Dict[str, Any]:
         validated_uid = self._validate_uid(uid)
         validated_id = self._validate_open_food_facts_id(open_food_facts_id)
@@ -466,14 +540,23 @@ class PantriesService:
         validated_product_name = self._validate_product_name(product_name)
         nutrients_was_provided = nutrients is not None
         validated_nutrients = self._validate_nutrients(nutrients)
+        package_weight_was_provided = package_weight_grams is not None
+        validated_package_weight_grams = self._validate_package_weight_grams(
+            package_weight_grams
+        )
 
         if product_name_was_provided and not validated_product_name:
             raise PantriesError(
                 "productName deve essere una stringa non vuota", status_code=400
             )
-        if not quantity_was_provided and not product_name_was_provided and not nutrients_was_provided:
+        if (
+            not quantity_was_provided
+            and not product_name_was_provided
+            and not nutrients_was_provided
+            and not package_weight_was_provided
+        ):
             raise PantriesError(
-                "Almeno uno tra quantity, productName, kcal, prot, fat, carbs deve essere valorizzato",
+                "Almeno uno tra quantity, productName, nutrients, packageWeightGrams deve essere valorizzato",
                 status_code=400,
             )
 
@@ -494,6 +577,7 @@ class PantriesService:
             current_food_name = self._normalize_stored_product_name(data.get("foodName"))
             source = self._normalize_stored_source(data.get("source"), validated_id)
             current_nutrients = self._extract_stored_nutrients(data)
+            current_package_weight = self._extract_stored_package_weight_grams(data)
 
             final_quantity = validated_quantity if quantity_was_provided else current_quantity
             final_product_name = (
@@ -503,6 +587,11 @@ class PantriesService:
                 self._to_complete_nutrients(validated_nutrients)
                 if nutrients_was_provided
                 else current_nutrients
+            )
+            final_package_weight = (
+                validated_package_weight_grams
+                if package_weight_was_provided
+                else current_package_weight
             )
             final_food_name = self._resolve_food_name(
                 source=source,
@@ -514,7 +603,7 @@ class PantriesService:
 
             if final_quantity == 0:
                 transaction.delete(item_ref)
-                return {
+                deleted_payload = {
                     "openFoodFactsId": validated_id,
                     "productName": final_product_name,
                     "quantity": 0,
@@ -522,6 +611,9 @@ class PantriesService:
                     "created": False,
                     "deleted": True,
                 }
+                if final_package_weight is not None:
+                    deleted_payload["packageWeightGrams"] = final_package_weight
+                return deleted_payload
 
             update_payload = {
                 "productName": final_product_name,
@@ -532,9 +624,12 @@ class PantriesService:
             if quantity_was_provided:
                 update_payload["quantity"] = final_quantity
             update_payload.update(self._build_nutrients_storage(final_nutrients))
+            update_payload.update(
+                self._build_package_weight_storage(final_package_weight)
+            )
             update_payload.update(self._build_legacy_nutrients_cleanup())
             transaction.update(item_ref, update_payload)
-            return {
+            updated_payload = {
                 "openFoodFactsId": validated_id,
                 "productName": final_product_name,
                 "quantity": final_quantity,
@@ -542,6 +637,9 @@ class PantriesService:
                 "created": False,
                 "deleted": False,
             }
+            if final_package_weight is not None:
+                updated_payload["packageWeightGrams"] = final_package_weight
+            return updated_payload
 
         result = self._run_transaction(_tx)
         if result.get("quantity", 0) > 0:
@@ -549,6 +647,7 @@ class PantriesService:
                 open_food_facts_id=result["openFoodFactsId"],
                 product_name=result["productName"],
                 nutrients=result.get("nutrients"),
+                package_weight_grams=result.get("packageWeightGrams"),
             )
         return result
 
@@ -573,6 +672,9 @@ class PantriesService:
             )
             snapshot_data = snapshot.to_dict() or {}
             current_nutrients = self._extract_stored_nutrients(snapshot_data)
+            current_package_weight = self._extract_stored_package_weight_grams(
+                snapshot_data
+            )
 
             if current_quantity == 1:
                 transaction.delete(item_ref)
@@ -586,13 +688,16 @@ class PantriesService:
                     {"quantity": new_quantity, "lastUpdated": SERVER_TIMESTAMP},
                 )
 
-            return {
+            result_payload = {
                 "openFoodFactsId": validated_id,
                 "productName": current_product_name,
                 "quantity": new_quantity,
                 "nutrients": current_nutrients,
                 "deleted": deleted,
             }
+            if current_package_weight is not None:
+                result_payload["packageWeightGrams"] = current_package_weight
+            return result_payload
 
         return self._run_transaction(_tx)
 
@@ -638,6 +743,9 @@ class PantriesService:
             nutrients = self._extract_stored_nutrients(data)
             if self._has_non_zero_nutrients(nutrients):
                 item_payload["nutrients"] = nutrients
+            package_weight = self._extract_stored_package_weight_grams(data)
+            if package_weight is not None:
+                item_payload["packageWeightGrams"] = package_weight
             items.append(item_payload)
 
         items.sort(key=lambda x: x["productName"].lower())
@@ -691,11 +799,16 @@ class PantriesService:
 
         # 1) Search recent OFF lookups cached in memory (no Firestore persistence).
         for code, data in self._iter_cached_search_entries():
-            by_code[code] = {
-                "code": code,
-                "product_name": self._normalize_text(data.get("product_name")),
-                "brands": self._normalize_text(data.get("brands")),
-            }
+                by_code[code] = {
+                    "code": code,
+                    "product_name": self._normalize_text(data.get("product_name")),
+                    "brands": self._normalize_text(data.get("brands")),
+                }
+                cached_package_weight = self._validate_package_weight_grams(
+                    data.get("package_weight_grams")
+                )
+                if cached_package_weight is not None:
+                    by_code[code]["packageWeightGrams"] = cached_package_weight
 
         # 2) Fallback to live pantry documents.
         collection_group = getattr(self._db, "collection_group", None)
@@ -715,6 +828,7 @@ class PantriesService:
                         continue
 
                     product_name = self._normalize_text(data.get("productName"))
+                    package_weight = self._extract_stored_package_weight_grams(data)
                     if code not in by_code or (
                         product_name and not by_code[code].get("product_name")
                     ):
@@ -723,6 +837,11 @@ class PantriesService:
                             "product_name": product_name,
                             "brands": "",
                         }
+                    if (
+                        package_weight is not None
+                        and by_code[code].get("packageWeightGrams") is None
+                    ):
+                        by_code[code]["packageWeightGrams"] = package_weight
             except Exception:
                 pass
 
@@ -769,6 +888,7 @@ class PantriesService:
                 ),
                 brands=self._extract_off_brands(product),
                 nutrients=self._extract_off_nutrients(product),
+                package_weight_grams=self._extract_off_package_weight_grams(product),
             )
 
     @staticmethod
@@ -785,6 +905,7 @@ class PantriesService:
         product_name: str,
         brands: str = "",
         nutrients: Optional[Dict[str, float]] = None,
+        package_weight_grams: Optional[float] = None,
     ) -> None:
         normalized_code = self._normalize_text(open_food_facts_id)
         if not normalized_code:
@@ -794,6 +915,9 @@ class PantriesService:
             normalized_nutrients = self._validate_nutrients(nutrients)
         except PantriesError:
             normalized_nutrients = {}
+        validated_package_weight_grams = self._validate_package_weight_grams(
+            package_weight_grams
+        )
 
         self._cleanup_expired_search_cache()
         if normalized_code in self._search_cache:
@@ -806,6 +930,8 @@ class PantriesService:
         }
         if normalized_nutrients:
             payload["nutrients"] = normalized_nutrients
+        if validated_package_weight_grams is not None:
+            payload["package_weight_grams"] = validated_package_weight_grams
 
         self._search_cache[normalized_code] = payload
         try:
@@ -962,7 +1088,7 @@ class PantriesService:
 
     @staticmethod
     def _map_off_product(product: Dict[str, Any]) -> Dict[str, Any]:
-        return {
+        mapped = {
             "openFoodFactsId": PantriesService._normalize_text(product.get("code")),
             "productName": PantriesService._extract_off_product_name(
                 product,
@@ -973,6 +1099,10 @@ class PantriesService:
             "imageUrl": PantriesService._extract_off_image_url(product),
             "nutrients": PantriesService._extract_off_nutrients(product),
         }
+        package_weight_grams = PantriesService._extract_off_package_weight_grams(product)
+        if package_weight_grams is not None:
+            mapped["packageWeightGrams"] = package_weight_grams
+        return mapped
 
     @staticmethod
     def _map_off_search_product(
@@ -986,6 +1116,9 @@ class PantriesService:
             ),
             "brands": PantriesService._extract_off_brands(product),
         }
+        package_weight_grams = PantriesService._extract_off_package_weight_grams(product)
+        if package_weight_grams is not None:
+            mapped["packageWeightGrams"] = package_weight_grams
 
         if nutrients:
             protein = nutrients.get("protein")
@@ -1109,6 +1242,72 @@ class PantriesService:
             nutrients["fat"] = fat
         return nutrients
 
+    @staticmethod
+    def _extract_off_package_weight_grams(product: Dict[str, Any]) -> Optional[float]:
+        product_quantity = PantriesService._parse_non_negative_float(
+            product.get("product_quantity")
+        )
+        product_quantity_unit = PantriesService._normalize_text(
+            product.get("product_quantity_unit")
+        ).lower()
+        converted = PantriesService._convert_weight_to_grams(
+            product_quantity, product_quantity_unit
+        )
+        if converted is not None:
+            return converted
+
+        quantity_label = PantriesService._normalize_text(product.get("quantity")).lower()
+        if not quantity_label:
+            return None
+
+        multipack_match = re.search(
+            r"(\d+(?:[.,]\d+)?)\s*[xX]\s*(\d+(?:[.,]\d+)?)\s*(kg|g|mg)\b",
+            quantity_label,
+        )
+        if multipack_match:
+            packs = PantriesService._parse_non_negative_float(multipack_match.group(1))
+            per_pack = PantriesService._parse_non_negative_float(multipack_match.group(2))
+            unit = multipack_match.group(3)
+            if packs is not None:
+                per_pack_grams = PantriesService._convert_weight_to_grams(per_pack, unit)
+                if per_pack_grams is not None:
+                    return round(packs * per_pack_grams, 3)
+
+        single_match = re.search(r"(\d+(?:[.,]\d+)?)\s*(kg|g|mg)\b", quantity_label)
+        if single_match:
+            amount = PantriesService._parse_non_negative_float(single_match.group(1))
+            unit = single_match.group(2)
+            return PantriesService._convert_weight_to_grams(amount, unit)
+
+        return None
+
+    @staticmethod
+    def _convert_weight_to_grams(
+        quantity: Optional[float], unit: str
+    ) -> Optional[float]:
+        if quantity is None:
+            return None
+        normalized_unit = PantriesService._normalize_text(unit).lower()
+        if normalized_unit in {"g", "gram", "grams"}:
+            return round(quantity, 3)
+        if normalized_unit in {"kg", "kilogram", "kilograms"}:
+            return round(quantity * 1000.0, 3)
+        if normalized_unit in {"mg", "milligram", "milligrams"}:
+            return round(quantity / 1000.0, 3)
+        return None
+
+    @staticmethod
+    def _parse_non_negative_float(value: Any) -> Optional[float]:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            parsed = float(str(value).strip().replace(",", "."))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(parsed) or parsed < 0:
+            return None
+        return parsed
+
     def _get_cached_product_entry(self, open_food_facts_id: str) -> Dict[str, Any]:
         normalized_code = self._normalize_text(open_food_facts_id)
         if not normalized_code:
@@ -1132,6 +1331,11 @@ class PantriesService:
         nutrients = entry.get("nutrients")
         if isinstance(nutrients, dict) and nutrients:
             payload["nutrients"] = dict(nutrients)
+        package_weight_grams = self._validate_package_weight_grams(
+            entry.get("package_weight_grams")
+        )
+        if package_weight_grams is not None:
+            payload["package_weight_grams"] = package_weight_grams
         return payload
 
     def _resolve_item_identity(
@@ -1210,6 +1414,14 @@ class PantriesService:
         }
 
     @staticmethod
+    def _build_package_weight_storage(
+        package_weight_grams: Optional[float],
+    ) -> Dict[str, Any]:
+        if package_weight_grams is None:
+            return {}
+        return {"packageWeightGrams": float(package_weight_grams)}
+
+    @staticmethod
     def _build_legacy_nutrients_cleanup() -> Dict[str, Any]:
         return {
             "prot": firestore.DELETE_FIELD,
@@ -1228,6 +1440,14 @@ class PantriesService:
                 top_level_payload
             )
         return self._to_complete_nutrients(parsed)
+
+    def _extract_stored_package_weight_grams(
+        self, data: Dict[str, Any]
+    ) -> Optional[float]:
+        try:
+            return self._validate_package_weight_grams(data.get("packageWeightGrams"))
+        except PantriesError:
+            return None
 
     @staticmethod
     def _has_non_zero_nutrients(nutrients: Dict[str, float]) -> bool:
@@ -1351,6 +1571,26 @@ class PantriesService:
                 )
             parsed[key] = value
 
+        return parsed
+
+    @staticmethod
+    def _validate_package_weight_grams(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise PantriesError(
+                "packageWeightGrams deve essere un numero >= 0", status_code=400
+            )
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise PantriesError(
+                "packageWeightGrams deve essere un numero >= 0", status_code=400
+            ) from exc
+        if not math.isfinite(parsed) or parsed < 0:
+            raise PantriesError(
+                "packageWeightGrams deve essere un numero >= 0", status_code=400
+            )
         return parsed
 
     @staticmethod
