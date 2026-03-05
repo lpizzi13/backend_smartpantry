@@ -59,6 +59,103 @@ def get_user_data():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
+@app.route('/register-user', methods=['POST'])
+def register_user():
+    """
+    Crea un nuovo utente sia in Firebase Authentication sia in Firestore.
+
+    Passaggi:
+    1. Usa `auth.create_user` per registrare email e password in Auth.
+    2. Salva un documento nella collezione `users` con l'UID restituito.
+
+    Corpo JSON atteso:
+    {
+        "email": "user@example.com",       // obbligatorio
+        "password": "secret123",          // obbligatorio
+        // campi opzionali da inserire direttamente nel documento:
+        "name": "Nome Utente",
+        "biometrics": {"age":0, "height":0, "weight":0, "gender":""},
+        "goals": {"dailyKcal":0, "fitnessGoal":"maintainance","macrosTarget":{"carbs":0,"protein":0,"fat":0}},
+        "profile_image_url": "",
+        "manualOverride": false
+    }
+
+    Valida presenza di email/password e restituisce 400 se mancanti.
+    Se la creazione Auth fallisce (es. email già usata) restituisce 400/500.
+    """
+    data = request.json or {}
+    email = data.get('email')
+    password = data.get('password')
+
+    if not email or not password:
+        return jsonify({"error": "email e password obbligatorie"}), 400
+
+    try:
+        # crea utente in Firebase Auth
+        user_record = auth.create_user(email=email, password=password)
+        uid = user_record.uid
+
+        # prepare dati base
+        biometrics = data.get('biometrics') or {"age":0, "height":0, "weight":0, "gender":""}
+        goals_in = data.get('goals', {})
+        manual_override = bool(data.get('manualOverride', False))
+
+        # se sono presenti biometrics e fitnessGoal, calcoliamo i valori come in update_user
+        if biometrics and goals_in.get('fitnessGoal') and not manual_override:
+            try:
+                weight = float(biometrics['weight'])
+                height = float(biometrics['height'])
+                age = int(biometrics['age'])
+                gender = biometrics['gender'].lower()
+                activity_multiplier = float(biometrics.get('activityLevel', 1.2))
+                fitness_goal = goals_in.get('fitnessGoal', 'maintainance').lower()
+
+                # BMR
+                if gender == 'm' or gender == 'male':
+                    bmr = (10 * weight) + (6.25 * height) - (5 * age) + 5
+                else:
+                    bmr = (10 * weight) + (6.25 * height) - (5 * age) - 161
+
+                tdee_base = int(bmr * activity_multiplier)
+                if fitness_goal == 'deficit':
+                    daily_kcal = tdee_base - 500
+                elif fitness_goal == 'surplus':
+                    daily_kcal = tdee_base + 300
+                else:
+                    daily_kcal = tdee_base
+
+                macros = {
+                    "carbs": int((daily_kcal * 0.50) / 4),
+                    "protein": int((daily_kcal * 0.20) / 4),
+                    "fat": int((daily_kcal * 0.30) / 9)
+                }
+
+                goals = {
+                    "dailyKcal": daily_kcal,
+                    "fitnessGoal": fitness_goal,
+                    "macrosTarget": macros
+                }
+            except Exception:
+                # se qualcosa va storto nel calcolo, ricadiamo su valori di default
+                goals = goals_in or {"dailyKcal":0, "fitnessGoal":"maintainance", "macrosTarget":{"carbs":0,"protein":0,"fat":0}}
+        else:
+            goals = goals_in or {"dailyKcal":0, "fitnessGoal":"maintainance", "macrosTarget":{"carbs":0,"protein":0,"fat":0}}
+
+        doc = {
+            "uid": uid,
+            "email": email,
+            "name": data.get('name', 'Nuovo Utente'),
+            "biometrics": biometrics,
+            "goals": goals,
+            "profile_image_url": data.get('profile_image_url', ''),
+            "manualOverride": manual_override
+        }
+        db.collection('users').document(uid).set(doc)
+        return jsonify({"status": "created", "uid": uid, "userData": doc}), 201
+    except Exception as e:
+        # propagate error message (es. email già in uso)
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/update-user', methods=['POST'])
 def update_user():
     data = request.json
@@ -150,49 +247,6 @@ def update_user():
             "macros": macros
         }), 200
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/save-diet', methods=['POST'])
-def save_diet():
-    data = request.json or {}
-    uid = data.get('uid')
-    diet_data = data.get('dietData')
-
-    if not uid:
-        return jsonify({"error": "UID mancante"}), 400
-
-    if diet_data is None:
-        return jsonify({"error": "dietData mancante"}), 400
-
-
-    try:
-        user_ref = db.collection('users').document(uid)
-        user_ref.set({"dietData": diet_data}, merge=True)
-        return jsonify({"status": "success"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/get-diet', methods=['POST'])
-def get_diet():
-    data = request.json or {}
-    uid = data.get('uid')
-
-    if not uid:
-        return jsonify({"error": "UID mancante"}), 400
-
-    try:
-        user_ref = db.collection('users').document(uid)
-        doc = user_ref.get()
-
-        if not doc.exists:
-            return jsonify({"error": "Utente non trovato"}), 404
-
-        user_data = doc.to_dict() or {}
-        return jsonify({
-            "status": "success",
-            "dietData": user_data.get("dietData")
-        }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
