@@ -153,5 +153,48 @@ def update_user():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/save-diet', methods=['POST'])
+def save_diet():
+    data = request.json or {}
+    uid = data.get('uid')
+    diet_data = data.get('dietData')
+
+    if not uid:
+        return jsonify({"error": "UID mancante"}), 400
+
+    if diet_data is None:
+        return jsonify({"error": "dietData mancante"}), 400
+
+
+    try:
+        user_ref = db.collection('users').document(uid)
+        user_ref.set({"dietData": diet_data}, merge=True)
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/get-diet', methods=['POST'])
+def get_diet():
+    data = request.json or {}
+    uid = data.get('uid')
+
+    if not uid:
+        return jsonify({"error": "UID mancante"}), 400
+
+    try:
+        user_ref = db.collection('users').document(uid)
+        doc = user_ref.get()
+
+        if not doc.exists:
+            return jsonify({"error": "Utente non trovato"}), 404
+
+        user_data = doc.to_dict() or {}
+        return jsonify({
+            "status": "success",
+            "dietData": user_data.get("dietData")
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=True)
