@@ -23,6 +23,44 @@ def _as_diet_document(entry):
     return diet_doc
 
 
+def _extract_diet_id(entry):
+    """Extract DUID from diet payload using known key variants."""
+    if not isinstance(entry, dict):
+        return None
+
+    for key in ("DUID", "duid", "dietId", "diet_id", "id"):
+        value = entry.get(key)
+        if value is None:
+            continue
+        value_str = str(value).strip()
+        if value_str:
+            return value_str
+    return None
+
+
+def _parse_diet_payload(diet_data):
+    """Support both legacy dietData and Android envelope {diets, selectedDietId}."""
+    selected_diet_id = None
+
+    if isinstance(diet_data, dict) and "diets" in diet_data:
+        selected_diet_id = diet_data.get("selectedDietId")
+        diets_container = diet_data.get("diets") or []
+    else:
+        diets_container = diet_data
+
+    if isinstance(diets_container, list):
+        diets_to_save = diets_container
+    elif isinstance(diets_container, dict):
+        diets_to_save = [diets_container]
+    else:
+        return None, None, "dietData non valido: attesi oggetti dieta o lista di oggetti"
+
+    if selected_diet_id is not None:
+        selected_diet_id = str(selected_diet_id).strip() or None
+
+    return diets_to_save, selected_diet_id, None
+
+
 def _serialize_firestore_value(value):
     """Convert Firestore values (e.g. datetime) into JSON-safe values."""
     if hasattr(value, "isoformat"):
@@ -197,17 +235,43 @@ def save_diet():
             return jsonify({"error": "Utente non trovato"}), 404
 
         diets_ref = user_ref.collection("diets")
-        diets_to_save = diet_data if isinstance(diet_data, list) else [diet_data]
+        diets_to_save, selected_diet_id, parse_error = _parse_diet_payload(diet_data)
+        if parse_error:
+            return jsonify({"error": parse_error}), 400
+
         saved_ids = []
 
-        batch = db.batch()
-        for entry in diets_to_save:
-            doc_ref = diets_ref.document()
-            batch.set(doc_ref, _as_diet_document(entry))
-            saved_ids.append(doc_ref.id)
+        if diets_to_save:
+            batch = db.batch()
+            for index, entry in enumerate(diets_to_save):
+                if not isinstance(entry, dict):
+                    return jsonify({
+                        "error": f"Elemento dieta non valido in posizione {index}: atteso oggetto"
+                    }), 400
 
-        batch.commit()
-        return jsonify({"status": "success", "savedDietIds": saved_ids}), 200
+                diet_id = _extract_diet_id(entry)
+                if not diet_id:
+                    return jsonify({
+                        "error": f"DUID mancante nell'elemento dieta in posizione {index}"
+                    }), 400
+
+                diet_doc = _as_diet_document(entry)
+                diet_doc["DUID"] = diet_id
+
+                doc_ref = diets_ref.document(diet_id)
+                batch.set(doc_ref, diet_doc, merge=True)
+                saved_ids.append(diet_id)
+
+            batch.commit()
+
+        if selected_diet_id is not None:
+            user_ref.set({"selectedDietId": selected_diet_id}, merge=True)
+
+        return jsonify({
+            "status": "success",
+            "savedDietIds": saved_ids,
+            "selectedDietId": selected_diet_id
+        }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -226,30 +290,45 @@ def get_diet():
         if not user_doc.exists:
             return jsonify({"error": "Utente non trovato"}), 404
 
+        user_data = user_doc.to_dict() or {}
+        selected_diet_id = user_data.get("selectedDietId")
+
         diet_docs = user_ref.collection("diets").stream()
         diets = []
         for diet_doc in diet_docs:
             diet_item = diet_doc.to_dict() or {}
+            diet_item.setdefault("DUID", diet_doc.id)
             diet_item["id"] = diet_doc.id
             diets.append(_serialize_firestore_value(diet_item))
 
         if diets:
+            diet_payload = {
+                "diets": diets,
+                "selectedDietId": selected_diet_id
+            }
             return jsonify({
                 "status": "success",
-                "diets": diets
+                "diets": diets,
+                "dietData": diet_payload
             }), 200
 
         # Fallback legacy: previously saved as users/{uid}.dietData
-        user_data = user_doc.to_dict() or {}
         legacy_diets = user_data.get("dietData")
         if legacy_diets is None:
             legacy_diets = []
         elif not isinstance(legacy_diets, list):
             legacy_diets = [legacy_diets]
 
+        serialized_legacy_diets = _serialize_firestore_value(legacy_diets)
+        diet_payload = {
+            "diets": serialized_legacy_diets,
+            "selectedDietId": selected_diet_id
+        }
+
         return jsonify({
             "status": "success",
-            "diets": _serialize_firestore_value(legacy_diets)
+            "diets": serialized_legacy_diets,
+            "dietData": diet_payload
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
