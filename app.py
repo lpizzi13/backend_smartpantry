@@ -256,7 +256,13 @@ def save_diet():
                     }), 400
 
                 diet_doc = _as_diet_document(entry)
-                diet_doc["DUID"] = diet_id
+                # Canonical key in Firestore: keep only lowercase "duid".
+                diet_doc["duid"] = diet_id
+                # Remove legacy aliases if present in existing docs.
+                diet_doc["DUID"] = firestore.DELETE_FIELD
+                diet_doc["dietId"] = firestore.DELETE_FIELD
+                diet_doc["diet_id"] = firestore.DELETE_FIELD
+                diet_doc["id"] = firestore.DELETE_FIELD
 
                 doc_ref = diets_ref.document(diet_id)
                 batch.set(doc_ref, diet_doc, merge=True)
@@ -297,8 +303,12 @@ def get_diet():
         diets = []
         for diet_doc in diet_docs:
             diet_item = diet_doc.to_dict() or {}
-            diet_item.setdefault("DUID", diet_doc.id)
-            diet_item["id"] = diet_doc.id
+            diet_id = _extract_diet_id(diet_item) or diet_doc.id
+            diet_item["duid"] = diet_id
+            diet_item.pop("DUID", None)
+            diet_item.pop("dietId", None)
+            diet_item.pop("diet_id", None)
+            diet_item.pop("id", None)
             diets.append(_serialize_firestore_value(diet_item))
 
         if diets:
