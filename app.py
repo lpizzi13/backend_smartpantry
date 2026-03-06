@@ -9,6 +9,30 @@ db = firestore.client()
 
 app = Flask(__name__)
 
+
+def _as_diet_document(entry):
+    """Normalize any diet entry into a Firestore-storable document."""
+    if isinstance(entry, dict):
+        diet_doc = dict(entry)
+    else:
+        diet_doc = {"value": entry}
+
+    # Add server timestamp if caller did not provide one.
+    if "createdAt" not in diet_doc:
+        diet_doc["createdAt"] = firestore.SERVER_TIMESTAMP
+    return diet_doc
+
+
+def _serialize_firestore_value(value):
+    """Convert Firestore values (e.g. datetime) into JSON-safe values."""
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, list):
+        return [_serialize_firestore_value(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _serialize_firestore_value(v) for k, v in value.items()}
+    return value
+
 @app.route('/get-user-data', methods=['POST'])
 def get_user_data():
     """
@@ -168,8 +192,22 @@ def save_diet():
 
     try:
         user_ref = db.collection('users').document(uid)
-        user_ref.set({"dietData": diet_data}, merge=True)
-        return jsonify({"status": "success"}), 200
+        user_doc = user_ref.get()
+        if not user_doc.exists:
+            return jsonify({"error": "Utente non trovato"}), 404
+
+        diets_ref = user_ref.collection("diets")
+        diets_to_save = diet_data if isinstance(diet_data, list) else [diet_data]
+        saved_ids = []
+
+        batch = db.batch()
+        for entry in diets_to_save:
+            doc_ref = diets_ref.document()
+            batch.set(doc_ref, _as_diet_document(entry))
+            saved_ids.append(doc_ref.id)
+
+        batch.commit()
+        return jsonify({"status": "success", "savedDietIds": saved_ids}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -183,15 +221,35 @@ def get_diet():
 
     try:
         user_ref = db.collection('users').document(uid)
-        doc = user_ref.get()
+        user_doc = user_ref.get()
 
-        if not doc.exists:
+        if not user_doc.exists:
             return jsonify({"error": "Utente non trovato"}), 404
 
-        user_data = doc.to_dict() or {}
+        diet_docs = user_ref.collection("diets").stream()
+        diets = []
+        for diet_doc in diet_docs:
+            diet_item = diet_doc.to_dict() or {}
+            diet_item["id"] = diet_doc.id
+            diets.append(_serialize_firestore_value(diet_item))
+
+        if diets:
+            return jsonify({
+                "status": "success",
+                "diets": diets
+            }), 200
+
+        # Fallback legacy: previously saved as users/{uid}.dietData
+        user_data = user_doc.to_dict() or {}
+        legacy_diets = user_data.get("dietData")
+        if legacy_diets is None:
+            legacy_diets = []
+        elif not isinstance(legacy_diets, list):
+            legacy_diets = [legacy_diets]
+
         return jsonify({
             "status": "success",
-            "dietData": user_data.get("dietData")
+            "diets": _serialize_firestore_value(legacy_diets)
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
