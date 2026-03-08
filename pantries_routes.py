@@ -24,9 +24,7 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
             {"q": query, "limit": limit, "lang": lang, "similar": similar_raw},
         )
         try:
-            similar = _parse_bool_query_param(
-                similar_raw, "similar"
-            )
+            similar = _parse_bool_query_param(similar_raw, "similar")
             search_payload = pantries_service.search_products(
                 query=query,
                 similar=similar,
@@ -34,18 +32,20 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
                 lang=lang,
             )
             response_payload = {
-                "status": "success",
                 "query": search_payload["query"],
-                "products": search_payload["products"],
-                "recommended": search_payload["recommended"],
-                # Backward compatibility with existing clients.
-                "results": search_payload["products"],
+                "products": [
+                    _normalize_search_product_for_client(product)
+                    for product in search_payload["products"]
+                ],
+                "recommended": [
+                    _normalize_search_product_for_client(product)
+                    for product in search_payload["recommended"]
+                ],
             }
             _log_backend(
                 "OUT",
                 "/pantry/search",
                 {
-                    "status": "success",
                     "query": response_payload["query"],
                     "productsCount": len(response_payload["products"]),
                     "recommendedCount": len(response_payload["recommended"]),
@@ -55,10 +55,7 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
                     ],
                 },
             )
-            return (
-                jsonify(response_payload),
-                200,
-            )
+            return jsonify(response_payload), 200
         except Exception as exc:
             return _handle_error(exc)
 
@@ -69,10 +66,8 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
             result = pantries_service.get_open_food_facts_product(barcode)
             nutrient_payload = _build_client_nutrient_payload(result.get("nutrients"))
             compatible_product = {
-                # Legacy fields expected by the Android client.
                 "code": result.get("openFoodFactsId", ""),
                 "product_name": result.get("productName", ""),
-                # Current backend fields.
                 "openFoodFactsId": result.get("openFoodFactsId", ""),
                 "productName": result.get("productName", ""),
                 "brands": result.get("brands", ""),
@@ -88,13 +83,9 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
             package_weight_grams = _extract_package_weight_grams(result)
             if package_weight_grams is not None:
                 compatible_product["packageWeightGrams"] = package_weight_grams
-            response_payload = {
-                # Keep numeric status for backward compatibility with
-                # clients that deserialize OFF-like payloads.
-                "status": 1,
-                "statusText": "success",
-                "product": compatible_product,
-            }
+                compatible_product["package_weight_grams"] = package_weight_grams
+                compatible_product["product_quantity"] = package_weight_grams
+            response_payload = {"status": 1, "product": compatible_product}
             _log_backend(
                 "OUT",
                 "/pantry/barcode",
@@ -104,10 +95,7 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
                     "product": _compact_product_payload(compatible_product),
                 },
             )
-            return (
-                jsonify(response_payload),
-                200,
-            )
+            return jsonify(response_payload), 200
         except Exception as exc:
             return _handle_error(exc)
 
@@ -116,50 +104,23 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
         payload = _get_json_payload()
         _log_backend("IN", "/pantry/add", _compact_request_payload(payload))
         try:
-            quantity = payload.get("quantity")
-            quantity_delta = payload.get("quantityDelta")
-            if quantity is not None and quantity_delta is not None:
-                raise PantriesError(
-                    "Usa quantity oppure quantityDelta, non entrambi",
-                    status_code=400,
-                )
-
-            if quantity is not None:
-                result = pantries_service.set_item_quantity(
-                    uid=payload.get("uid"),
-                    open_food_facts_id=payload.get("openFoodFactsId"),
-                    quantity=quantity,
-                    product_name=payload.get("productName"),
-                    nutrients=_extract_nutrients_payload(payload),
-                    package_weight_grams=_extract_package_weight_payload(payload),
-                    allow_zero=False,
-                )
-            else:
-                result = pantries_service.add_or_upsert_item(
-                    uid=payload.get("uid"),
-                    open_food_facts_id=payload.get("openFoodFactsId"),
-                    quantity_delta=quantity_delta,
-                    product_name=payload.get("productName"),
-                    nutrients=_extract_nutrients_payload(payload),
-                    package_weight_grams=_extract_package_weight_payload(payload),
-                )
+            result = pantries_service.set_item_quantity(
+                uid=payload.get("uid"),
+                open_food_facts_id=payload.get("openFoodFactsId"),
+                quantity=payload.get("quantity"),
+                product_name=payload.get("productName"),
+                nutrients=_extract_nutrients_payload(payload),
+                package_weight_grams=_extract_package_weight_payload(payload),
+                allow_zero=False,
+            )
+            item_payload = _normalize_pantry_item_for_client(result)
             status_code = 201 if result.get("created") else 200
-            item_payload = {
-                "openFoodFactsId": result["openFoodFactsId"],
-                "productName": result["productName"],
-                "quantity": result["quantity"],
-            }
-            if _has_non_zero_nutrients(result.get("nutrients")):
-                item_payload["nutrients"] = result["nutrients"]
-            package_weight_grams = result.get("packageWeightGrams")
-            if package_weight_grams is not None:
-                item_payload["packageWeightGrams"] = package_weight_grams
             _log_backend(
                 "OUT",
                 "/pantry/add",
                 {"status": "success", "item": _compact_product_payload(item_payload)},
             )
-            return (jsonify({"status": "success", "item": item_payload}), status_code)
+            return jsonify({"status": "success", "item": item_payload}), status_code
         except Exception as exc:
             return _handle_error(exc)
 
@@ -176,100 +137,15 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
                 nutrients=_extract_nutrients_payload(payload),
                 package_weight_grams=_extract_package_weight_payload(payload),
             )
-            item_payload = {
-                "openFoodFactsId": result["openFoodFactsId"],
-                "productName": result["productName"],
-                "quantity": result["quantity"],
-                "deleted": bool(result.get("deleted")),
-            }
-            if _has_non_zero_nutrients(result.get("nutrients")):
-                item_payload["nutrients"] = result["nutrients"]
-            package_weight_grams = result.get("packageWeightGrams")
-            if package_weight_grams is not None:
-                item_payload["packageWeightGrams"] = package_weight_grams
+            item_payload = _normalize_pantry_item_for_client(result)
+            item_payload["deleted"] = bool(result.get("deleted"))
             status_code = 201 if result.get("created") else 200
             _log_backend(
                 "OUT",
                 "/pantry/quantity",
                 {"status": "success", "item": _compact_product_payload(item_payload)},
             )
-            return (jsonify({"status": "success", "item": item_payload}), status_code)
-        except Exception as exc:
-            return _handle_error(exc)
-
-    @pantries_bp.route("/pantry/item", methods=["PATCH"])
-    def update_item() -> Tuple[Any, int]:
-        payload = _get_json_payload()
-        _log_backend("IN", "/pantry/item", _compact_request_payload(payload))
-        try:
-            result = pantries_service.update_item(
-                uid=payload.get("uid"),
-                open_food_facts_id=payload.get("openFoodFactsId"),
-                quantity=payload.get("quantity"),
-                product_name=payload.get("productName"),
-                nutrients=_extract_nutrients_payload(payload),
-                package_weight_grams=_extract_package_weight_payload(payload),
-            )
-            item_payload = {
-                "openFoodFactsId": result["openFoodFactsId"],
-                "productName": result["productName"],
-                "quantity": result["quantity"],
-                "deleted": bool(result.get("deleted")),
-            }
-            if _has_non_zero_nutrients(result.get("nutrients")):
-                item_payload["nutrients"] = result["nutrients"]
-            package_weight_grams = result.get("packageWeightGrams")
-            if package_weight_grams is not None:
-                item_payload["packageWeightGrams"] = package_weight_grams
-            _log_backend(
-                "OUT",
-                "/pantry/item",
-                {"status": "success", "item": _compact_product_payload(item_payload)},
-            )
-            return (jsonify({"status": "success", "item": item_payload}), 200)
-        except Exception as exc:
-            return _handle_error(exc)
-
-    @pantries_bp.route("/pantry/decrement", methods=["PATCH"])
-    def decrement_item() -> Tuple[Any, int]:
-        payload = _get_json_payload()
-        try:
-            result = pantries_service.decrement_item(
-                uid=payload.get("uid"),
-                open_food_facts_id=payload.get("openFoodFactsId"),
-            )
-            item_payload = {
-                "openFoodFactsId": result["openFoodFactsId"],
-                "productName": result["productName"],
-                "quantity": result["quantity"],
-                "deleted": result["deleted"],
-            }
-            if _has_non_zero_nutrients(result.get("nutrients")):
-                item_payload["nutrients"] = result["nutrients"]
-            package_weight_grams = result.get("packageWeightGrams")
-            if package_weight_grams is not None:
-                item_payload["packageWeightGrams"] = package_weight_grams
-            return (jsonify({"status": "success", "item": item_payload}), 200)
-        except Exception as exc:
-            return _handle_error(exc)
-
-    @pantries_bp.route("/pantry/item", methods=["DELETE"])
-    def delete_item() -> Tuple[Any, int]:
-        payload = _get_json_payload()
-        try:
-            result = pantries_service.delete_item(
-                uid=payload.get("uid"),
-                open_food_facts_id=payload.get("openFoodFactsId"),
-            )
-            return (
-                jsonify(
-                    {
-                        "status": "success",
-                        "deleted": result["openFoodFactsId"],
-                    }
-                ),
-                200,
-            )
+            return jsonify({"status": "success", "item": item_payload}), status_code
         except Exception as exc:
             return _handle_error(exc)
 
@@ -278,7 +154,8 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
         try:
             resolved_uid = uid if uid is not None else request.args.get("uid")
             items = pantries_service.list_items(uid=resolved_uid)
-            return jsonify({"status": "success", "items": items}), 200
+            response_items = [_normalize_pantry_item_for_client(item) for item in items]
+            return jsonify({"status": "success", "items": response_items}), 200
         except Exception as exc:
             return _handle_error(exc)
 
@@ -314,6 +191,61 @@ def _extract_package_weight_payload(payload: Dict[str, Any]) -> Any:
     return None
 
 
+def _normalize_pantry_item_for_client(item: Dict[str, Any]) -> Dict[str, Any]:
+    response_payload = {
+        "openFoodFactsId": item.get("openFoodFactsId", ""),
+        "productName": item.get("productName", ""),
+        "quantity": item.get("quantity", 0),
+    }
+    nutrient_payload = _build_client_nutrient_payload(item.get("nutrients"))
+    if _has_non_zero_nutrients(nutrient_payload["nutrients"]):
+        response_payload["kcal"] = nutrient_payload["kcal"]
+        response_payload["carbs"] = nutrient_payload["carbs"]
+        response_payload["fat"] = nutrient_payload["fat"]
+        response_payload["prot"] = nutrient_payload["prot"]
+        response_payload["protein"] = nutrient_payload["protein"]
+        response_payload["nutrients"] = nutrient_payload["nutrients"]
+
+    package_weight_grams = _extract_package_weight_grams(item)
+    if package_weight_grams is not None:
+        response_payload["packageWeightGrams"] = package_weight_grams
+        response_payload["package_weight_grams"] = package_weight_grams
+    return response_payload
+
+
+def _normalize_search_product_for_client(product: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(product if isinstance(product, dict) else {})
+    code = str(normalized.get("code") or normalized.get("openFoodFactsId") or "").strip()
+    product_name = (
+        str(normalized.get("product_name") or normalized.get("productName") or "").strip()
+    )
+    if code:
+        normalized["code"] = code
+        normalized["openFoodFactsId"] = code
+    if product_name:
+        normalized["product_name"] = product_name
+        normalized["productName"] = product_name
+
+    nutrient_payload = _build_client_nutrient_payload(
+        normalized.get("nutrients") or normalized.get("nutriments") or normalized
+    )
+    if _has_non_zero_nutrients(nutrient_payload["nutrients"]):
+        normalized["kcal"] = nutrient_payload["kcal"]
+        normalized["carbs"] = nutrient_payload["carbs"]
+        normalized["fat"] = nutrient_payload["fat"]
+        normalized["prot"] = nutrient_payload["prot"]
+        normalized["protein"] = nutrient_payload["protein"]
+        normalized["nutrients"] = nutrient_payload["nutrients"]
+        normalized["nutriments"] = nutrient_payload["nutriments"]
+
+    package_weight_grams = _extract_package_weight_grams(normalized)
+    if package_weight_grams is not None:
+        normalized["packageWeightGrams"] = package_weight_grams
+        normalized["package_weight_grams"] = package_weight_grams
+        normalized["product_quantity"] = package_weight_grams
+    return normalized
+
+
 def _has_non_zero_nutrients(nutrients: Any) -> bool:
     if not isinstance(nutrients, dict):
         return False
@@ -328,10 +260,24 @@ def _has_non_zero_nutrients(nutrients: Any) -> bool:
 
 def _build_client_nutrient_payload(raw_nutrients: Any) -> Dict[str, Any]:
     nutrients = raw_nutrients if isinstance(raw_nutrients, dict) else {}
-    kcal = _first_numeric(nutrients.get("kcal"))
-    carbs = _first_numeric(nutrients.get("carbs"))
-    fat = _first_numeric(nutrients.get("fat"))
-    protein = _first_numeric(nutrients.get("protein"), nutrients.get("prot"))
+    kcal = _first_numeric(
+        nutrients.get("kcal"),
+        nutrients.get("energy-kcal_100g"),
+        nutrients.get("energy_kcal_100g"),
+    )
+    carbs = _first_numeric(
+        nutrients.get("carbs"),
+        nutrients.get("carbohydrates_100g"),
+    )
+    fat = _first_numeric(
+        nutrients.get("fat"),
+        nutrients.get("fat_100g"),
+    )
+    protein = _first_numeric(
+        nutrients.get("protein"),
+        nutrients.get("prot"),
+        nutrients.get("proteins_100g"),
+    )
     return {
         "kcal": kcal,
         "carbs": carbs,
@@ -354,8 +300,12 @@ def _build_client_nutrient_payload(raw_nutrients: Any) -> Dict[str, Any]:
 
 
 def _extract_macros(product: Dict[str, Any]) -> Dict[str, float]:
-    nutrients = product.get("nutrients") if isinstance(product.get("nutrients"), dict) else {}
-    nutriments = product.get("nutriments") if isinstance(product.get("nutriments"), dict) else {}
+    nutrients = (
+        product.get("nutrients") if isinstance(product.get("nutrients"), dict) else {}
+    )
+    nutriments = (
+        product.get("nutriments") if isinstance(product.get("nutriments"), dict) else {}
+    )
     kcal = _first_numeric(
         product.get("kcal"),
         nutrients.get("kcal"),
@@ -408,7 +358,6 @@ def _compact_request_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "openFoodFactsId": payload.get("openFoodFactsId"),
         "productName": payload.get("productName"),
         "quantity": payload.get("quantity"),
-        "quantityDelta": payload.get("quantityDelta"),
         "kcal": macros["kcal"],
         "carbs": macros["carbs"],
         "fat": macros["fat"],
@@ -434,7 +383,7 @@ def _first_numeric(*values: Any) -> float:
 def _extract_package_weight_grams(payload: Any) -> Optional[float]:
     if not isinstance(payload, dict):
         return None
-    for key in ("packageWeightGrams", "package_weight_grams"):
+    for key in ("packageWeightGrams", "package_weight_grams", "product_quantity"):
         value = payload.get(key)
         if value is None:
             continue
@@ -467,7 +416,10 @@ def _handle_error(exc: Exception) -> Tuple[Any, int]:
     if isinstance(exc, gcloud_exceptions.InvalidArgument):
         return jsonify({"status": "error", "error": "Input Firestore non valido"}), 400
     if isinstance(exc, gcloud_exceptions.FailedPrecondition):
-        return jsonify({"status": "error", "error": "Operazione Firestore non consentita"}), 409
+        return (
+            jsonify({"status": "error", "error": "Operazione Firestore non consentita"}),
+            409,
+        )
     if isinstance(exc, gcloud_exceptions.GoogleAPICallError):
         return jsonify({"status": "error", "error": "Errore temporaneo Firestore"}), 503
     return jsonify({"status": "error", "error": "Errore interno del server"}), 500

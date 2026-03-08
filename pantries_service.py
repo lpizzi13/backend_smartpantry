@@ -200,162 +200,6 @@ class PantriesService:
         )
         return mapped_product
 
-    def add_or_upsert_item(
-        self,
-        uid: Any,
-        open_food_facts_id: Any,
-        quantity_delta: Any,
-        product_name: Any = None,
-        nutrients: Any = None,
-        package_weight_grams: Any = None,
-    ) -> Dict[str, Any]:
-        validated_uid = self._validate_uid(uid)
-        validated_delta = self._validate_positive_int(quantity_delta, "quantityDelta")
-        validated_product_name = self._validate_product_name(product_name)
-        validated_nutrients = self._validate_nutrients(nutrients)
-        validated_package_weight_grams = self._validate_package_weight_grams(
-            package_weight_grams
-        )
-        validated_id, item_source, requested_food_name = self._resolve_item_identity(
-            open_food_facts_id=open_food_facts_id,
-            product_name=validated_product_name,
-        )
-        should_update_product_name = bool(validated_product_name)
-        should_update_nutrients = bool(validated_nutrients)
-        should_update_package_weight = package_weight_grams is not None
-        cached_entry = self._get_cached_product_entry(validated_id)
-        cached_name = self._normalize_text(cached_entry.get("product_name"))
-        cached_nutrients = self._to_complete_nutrients(
-            self._validate_nutrients(cached_entry.get("nutrients"))
-        )
-        cached_package_weight = self._validate_package_weight_grams(
-            cached_entry.get("package_weight_grams")
-        )
-
-        # Riferimento: users/{uid}/pantry/{itemId}
-        item_ref = self._get_pantry_collection(validated_uid).document(validated_id)
-
-        def _tx(transaction: Any) -> Dict[str, Any]:
-            snapshot = item_ref.get(transaction=transaction)
-            created = not snapshot.exists
-
-            if created:
-                new_quantity = validated_delta
-                final_product_name = (
-                    validated_product_name
-                    or cached_name
-                    or (
-                        "Prodotto sconosciuto"
-                        if item_source == "openfoodfacts"
-                        else requested_food_name
-                    )
-                    or "Prodotto sconosciuto"
-                )
-                final_nutrients = self._to_complete_nutrients(
-                    validated_nutrients or cached_nutrients
-                )
-                final_package_weight = (
-                    validated_package_weight_grams
-                    if should_update_package_weight
-                    else cached_package_weight
-                )
-                final_food_name = self._resolve_food_name(
-                    source=item_source,
-                    open_food_facts_id=validated_id,
-                    current_food_name="",
-                    provided_food_name=requested_food_name,
-                    fallback_product_name=final_product_name,
-                )
-                create_payload = {
-                    "openFoodFactsId": validated_id,
-                    "foodName": final_food_name,
-                    "source": item_source,
-                    "productName": final_product_name,
-                    "quantity": new_quantity,
-                    "lastUpdated": SERVER_TIMESTAMP,
-                }
-                create_payload.update(self._build_nutrients_storage(final_nutrients))
-                create_payload.update(
-                    self._build_package_weight_storage(final_package_weight)
-                )
-                transaction.set(
-                    item_ref,
-                    create_payload,
-                )
-            else:
-                snapshot_data = snapshot.to_dict() or {}
-                current_quantity = self._parse_stored_quantity(
-                    snapshot.get("quantity"), validated_id
-                )
-                current_product_name = self._normalize_stored_product_name(
-                    snapshot.get("productName")
-                )
-                current_food_name = self._normalize_stored_product_name(
-                    snapshot_data.get("foodName")
-                )
-                current_source = self._normalize_stored_source(
-                    snapshot_data.get("source"), validated_id
-                )
-                new_quantity = current_quantity + validated_delta
-                update_payload = {
-                    "quantity": new_quantity,
-                    "lastUpdated": SERVER_TIMESTAMP,
-                    "source": current_source,
-                }
-                final_product_name = current_product_name or "Prodotto sconosciuto"
-                current_nutrients = self._extract_stored_nutrients(snapshot_data)
-                final_nutrients = current_nutrients
-                current_package_weight = self._extract_stored_package_weight_grams(
-                    snapshot_data
-                )
-                final_package_weight = current_package_weight
-                if should_update_product_name:
-                    update_payload["productName"] = validated_product_name
-                    final_product_name = validated_product_name
-                if should_update_nutrients:
-                    final_nutrients = self._to_complete_nutrients(validated_nutrients)
-                if should_update_package_weight:
-                    final_package_weight = validated_package_weight_grams
-                elif final_package_weight is None:
-                    final_package_weight = cached_package_weight
-                final_food_name = self._resolve_food_name(
-                    source=current_source,
-                    open_food_facts_id=validated_id,
-                    current_food_name=current_food_name,
-                    provided_food_name=validated_product_name or requested_food_name,
-                    fallback_product_name=final_product_name,
-                )
-                update_payload["foodName"] = final_food_name
-                update_payload.update(self._build_nutrients_storage(final_nutrients))
-                update_payload.update(
-                    self._build_package_weight_storage(final_package_weight)
-                )
-                update_payload.update(self._build_legacy_nutrients_cleanup())
-                transaction.update(
-                    item_ref,
-                    update_payload,
-                )
-
-            result_payload = {
-                "openFoodFactsId": validated_id,
-                "productName": final_product_name,
-                "quantity": new_quantity,
-                "nutrients": final_nutrients,
-                "created": created,
-            }
-            if final_package_weight is not None:
-                result_payload["packageWeightGrams"] = final_package_weight
-            return result_payload
-
-        result = self._run_transaction(_tx)
-        self._upsert_search_cache_entry(
-            open_food_facts_id=result["openFoodFactsId"],
-            product_name=result["productName"],
-            nutrients=result.get("nutrients") or validated_nutrients or cached_nutrients,
-            package_weight_grams=result.get("packageWeightGrams"),
-        )
-        return result
-
     def set_item_quantity(
         self,
         uid: Any,
@@ -368,7 +212,7 @@ class PantriesService:
     ) -> Dict[str, Any]:
         validated_uid = self._validate_uid(uid)
         validated_product_name = self._validate_product_name(product_name)
-        validated_id, item_source, requested_food_name = self._resolve_item_identity(
+        validated_id, item_source = self._resolve_item_identity(
             open_food_facts_id=open_food_facts_id,
             product_name=validated_product_name,
         )
@@ -400,9 +244,6 @@ class PantriesService:
             current_product_name = self._normalize_stored_product_name(
                 snapshot.get("productName")
             )
-            current_food_name = self._normalize_stored_product_name(
-                snapshot_data.get("foodName")
-            )
             current_source = self._normalize_stored_source(
                 snapshot_data.get("source"),
                 validated_id,
@@ -431,13 +272,6 @@ class PantriesService:
                 )
             )
             final_source = current_source if exists else item_source
-            final_food_name = self._resolve_food_name(
-                source=final_source,
-                open_food_facts_id=validated_id,
-                current_food_name=current_food_name,
-                provided_food_name=validated_product_name or requested_food_name,
-                fallback_product_name=final_product_name,
-            )
 
             if validated_quantity == 0:
                 if exists:
@@ -457,7 +291,6 @@ class PantriesService:
             if not exists:
                 create_payload = {
                     "openFoodFactsId": validated_id,
-                    "foodName": final_food_name,
                     "source": final_source,
                     "productName": final_product_name,
                     "quantity": validated_quantity,
@@ -484,7 +317,6 @@ class PantriesService:
                 "quantity": validated_quantity,
                 "lastUpdated": SERVER_TIMESTAMP,
                 "source": final_source,
-                "foodName": final_food_name,
             }
             if should_update_product_name:
                 update_payload["productName"] = validated_product_name
@@ -518,206 +350,6 @@ class PantriesService:
                 package_weight_grams=result.get("packageWeightGrams"),
             )
         return result
-
-    def update_item(
-        self,
-        uid: Any,
-        open_food_facts_id: Any,
-        quantity: Any = None,
-        product_name: Any = None,
-        nutrients: Any = None,
-        package_weight_grams: Any = None,
-    ) -> Dict[str, Any]:
-        validated_uid = self._validate_uid(uid)
-        validated_id = self._validate_open_food_facts_id(open_food_facts_id)
-        quantity_was_provided = quantity is not None
-        validated_quantity = (
-            self._validate_non_negative_int(quantity, "quantity")
-            if quantity_was_provided
-            else 0
-        )
-        product_name_was_provided = product_name is not None
-        validated_product_name = self._validate_product_name(product_name)
-        nutrients_was_provided = nutrients is not None
-        validated_nutrients = self._validate_nutrients(nutrients)
-        package_weight_was_provided = package_weight_grams is not None
-        validated_package_weight_grams = self._validate_package_weight_grams(
-            package_weight_grams
-        )
-
-        if product_name_was_provided and not validated_product_name:
-            raise PantriesError(
-                "productName deve essere una stringa non vuota", status_code=400
-            )
-        if (
-            not quantity_was_provided
-            and not product_name_was_provided
-            and not nutrients_was_provided
-            and not package_weight_was_provided
-        ):
-            raise PantriesError(
-                "Almeno uno tra quantity, productName, nutrients, packageWeightGrams deve essere valorizzato",
-                status_code=400,
-            )
-
-        item_ref = self._get_pantry_collection(validated_uid).document(validated_id)
-
-        def _tx(transaction: Any) -> Dict[str, Any]:
-            snapshot = item_ref.get(transaction=transaction)
-            if not snapshot.exists:
-                raise PantriesError(
-                    "Item non trovato nella dispensa", status_code=404
-                )
-
-            data = snapshot.to_dict() or {}
-            current_quantity = self._parse_stored_quantity(
-                data.get("quantity"), validated_id
-            )
-            current_product_name = self._normalize_stored_product_name(data.get("productName"))
-            current_food_name = self._normalize_stored_product_name(data.get("foodName"))
-            source = self._normalize_stored_source(data.get("source"), validated_id)
-            current_nutrients = self._extract_stored_nutrients(data)
-            current_package_weight = self._extract_stored_package_weight_grams(data)
-
-            final_quantity = validated_quantity if quantity_was_provided else current_quantity
-            final_product_name = (
-                validated_product_name if product_name_was_provided else current_product_name
-            ) or "Prodotto sconosciuto"
-            final_nutrients = (
-                self._to_complete_nutrients(validated_nutrients)
-                if nutrients_was_provided
-                else current_nutrients
-            )
-            final_package_weight = (
-                validated_package_weight_grams
-                if package_weight_was_provided
-                else current_package_weight
-            )
-            final_food_name = self._resolve_food_name(
-                source=source,
-                open_food_facts_id=validated_id,
-                current_food_name=current_food_name,
-                provided_food_name=validated_product_name,
-                fallback_product_name=final_product_name,
-            )
-
-            if final_quantity == 0:
-                transaction.delete(item_ref)
-                deleted_payload = {
-                    "openFoodFactsId": validated_id,
-                    "productName": final_product_name,
-                    "quantity": 0,
-                    "nutrients": final_nutrients,
-                    "created": False,
-                    "deleted": True,
-                }
-                if final_package_weight is not None:
-                    deleted_payload["packageWeightGrams"] = final_package_weight
-                return deleted_payload
-
-            update_payload = {
-                "productName": final_product_name,
-                "foodName": final_food_name,
-                "source": source,
-                "lastUpdated": SERVER_TIMESTAMP,
-            }
-            if quantity_was_provided:
-                update_payload["quantity"] = final_quantity
-            update_payload.update(self._build_nutrients_storage(final_nutrients))
-            update_payload.update(
-                self._build_package_weight_storage(final_package_weight)
-            )
-            update_payload.update(self._build_legacy_nutrients_cleanup())
-            transaction.update(item_ref, update_payload)
-            updated_payload = {
-                "openFoodFactsId": validated_id,
-                "productName": final_product_name,
-                "quantity": final_quantity,
-                "nutrients": final_nutrients,
-                "created": False,
-                "deleted": False,
-            }
-            if final_package_weight is not None:
-                updated_payload["packageWeightGrams"] = final_package_weight
-            return updated_payload
-
-        result = self._run_transaction(_tx)
-        if result.get("quantity", 0) > 0:
-            self._upsert_search_cache_entry(
-                open_food_facts_id=result["openFoodFactsId"],
-                product_name=result["productName"],
-                nutrients=result.get("nutrients"),
-                package_weight_grams=result.get("packageWeightGrams"),
-            )
-        return result
-
-    def decrement_item(self, uid: Any, open_food_facts_id: Any) -> Dict[str, Any]:
-        validated_uid = self._validate_uid(uid)
-        validated_id = self._validate_open_food_facts_id(open_food_facts_id)
-
-        item_ref = self._get_pantry_collection(validated_uid).document(validated_id)
-
-        def _tx(transaction: Any) -> Dict[str, Any]:
-            snapshot = item_ref.get(transaction=transaction)
-            if not snapshot.exists:
-                raise PantriesError(
-                    "Item non trovato nella dispensa", status_code=404
-                )
-
-            current_quantity = self._parse_stored_quantity(
-                snapshot.get("quantity"), validated_id
-            )
-            current_product_name = self._normalize_stored_product_name(
-                snapshot.get("productName")
-            )
-            snapshot_data = snapshot.to_dict() or {}
-            current_nutrients = self._extract_stored_nutrients(snapshot_data)
-            current_package_weight = self._extract_stored_package_weight_grams(
-                snapshot_data
-            )
-
-            if current_quantity == 1:
-                transaction.delete(item_ref)
-                new_quantity = 0
-                deleted = True
-            else:
-                new_quantity = current_quantity - 1
-                deleted = False
-                transaction.update(
-                    item_ref,
-                    {"quantity": new_quantity, "lastUpdated": SERVER_TIMESTAMP},
-                )
-
-            result_payload = {
-                "openFoodFactsId": validated_id,
-                "productName": current_product_name,
-                "quantity": new_quantity,
-                "nutrients": current_nutrients,
-                "deleted": deleted,
-            }
-            if current_package_weight is not None:
-                result_payload["packageWeightGrams"] = current_package_weight
-            return result_payload
-
-        return self._run_transaction(_tx)
-
-    def delete_item(self, uid: Any, open_food_facts_id: Any) -> Dict[str, Any]:
-        validated_uid = self._validate_uid(uid)
-        validated_id = self._validate_open_food_facts_id(open_food_facts_id)
-
-        item_ref = self._get_pantry_collection(validated_uid).document(validated_id)
-
-        def _tx(transaction: Any) -> Dict[str, Any]:
-            snapshot = item_ref.get(transaction=transaction)
-            if not snapshot.exists:
-                raise PantriesError(
-                    "Item non trovato nella dispensa", status_code=404
-                )
-
-            transaction.delete(item_ref)
-            return {"openFoodFactsId": validated_id}
-
-        return self._run_transaction(_tx)
 
     def list_items(self, uid: Any) -> List[Dict[str, Any]]:
         validated_uid = self._validate_uid(uid)
@@ -1340,16 +972,16 @@ class PantriesService:
 
     def _resolve_item_identity(
         self, open_food_facts_id: Any, product_name: str
-    ) -> Tuple[str, str, str]:
+    ) -> Tuple[str, str]:
         normalized_id = self._normalize_text(open_food_facts_id)
         normalized_product_name = self._normalize_text(product_name)
         if normalized_id:
             source = "manual" if self._is_manual_item_id(normalized_id) else "openfoodfacts"
-            return normalized_id, source, normalized_product_name
+            return normalized_id, source
 
         if normalized_product_name:
             manual_id = self._build_manual_item_id(normalized_product_name)
-            return manual_id, "manual", normalized_product_name
+            return manual_id, "manual"
 
         raise PantriesError("openFoodFactsId o productName obbligatorio", status_code=400)
 
@@ -1377,24 +1009,6 @@ class PantriesService:
         return "openfoodfacts"
 
     @staticmethod
-    def _resolve_food_name(
-        source: str,
-        open_food_facts_id: str,
-        current_food_name: str,
-        provided_food_name: str,
-        fallback_product_name: str,
-    ) -> str:
-        if source == "openfoodfacts":
-            return open_food_facts_id
-
-        return (
-            PantriesService._normalize_text(provided_food_name)
-            or PantriesService._normalize_text(current_food_name)
-            or PantriesService._normalize_text(fallback_product_name)
-            or "Alimento manuale"
-        )
-
-    @staticmethod
     def _to_complete_nutrients(nutrients: Dict[str, float]) -> Dict[str, float]:
         return {
             "kcal": float(nutrients.get("kcal", 0.0)),
@@ -1408,9 +1022,6 @@ class PantriesService:
         complete = PantriesService._to_complete_nutrients(nutrients)
         return {
             "nutrients": complete,
-            "kcal": complete["kcal"],
-            "carbs": complete["carbs"],
-            "fat": complete["fat"],
         }
 
     @staticmethod
@@ -1424,6 +1035,10 @@ class PantriesService:
     @staticmethod
     def _build_legacy_nutrients_cleanup() -> Dict[str, Any]:
         return {
+            "foodName": firestore.DELETE_FIELD,
+            "kcal": firestore.DELETE_FIELD,
+            "carbs": firestore.DELETE_FIELD,
+            "fat": firestore.DELETE_FIELD,
             "prot": firestore.DELETE_FIELD,
             "protein": firestore.DELETE_FIELD,
         }
@@ -1478,33 +1093,6 @@ class PantriesService:
         if not isinstance(uid, str) or not uid.strip():
             raise PantriesError("uid obbligatorio", status_code=400)
         return uid.strip()
-
-    @staticmethod
-    def _validate_open_food_facts_id(open_food_facts_id: Any) -> str:
-        if not isinstance(open_food_facts_id, str) or not open_food_facts_id.strip():
-            raise PantriesError("openFoodFactsId obbligatorio", status_code=400)
-        return open_food_facts_id.strip()
-
-    @staticmethod
-    def _validate_positive_int(value: Any, field_name: str) -> int:
-        if isinstance(value, bool):
-            raise PantriesError(
-                f"{field_name} deve essere un intero >= 1", status_code=400
-            )
-
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError) as exc:
-            raise PantriesError(
-                f"{field_name} deve essere un intero >= 1", status_code=400
-            ) from exc
-
-        if parsed < 1:
-            raise PantriesError(
-                f"{field_name} deve essere un intero >= 1", status_code=400
-            )
-
-        return parsed
 
     @staticmethod
     def _validate_non_negative_int(value: Any, field_name: str) -> int:
