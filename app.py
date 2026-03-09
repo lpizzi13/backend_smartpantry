@@ -11,11 +11,6 @@ db = firestore.client()
 app = Flask(__name__)
 app.register_blueprint(create_pantries_blueprint(db))
 
-@app.route('/user/login', methods=['POST'])
-def login():
-    """Alias per /get-user-data per compatibilità con il frontend"""
-    return get_user_data()
-
 @app.route('/get-user-data', methods=['POST'])
 def get_user_data():
     """
@@ -164,7 +159,6 @@ def register_user():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/update-user', methods=['POST'])
-@app.route('/user/update', methods=['POST'])
 def update_user():
     data = request.json
     uid = data.get('uid')
