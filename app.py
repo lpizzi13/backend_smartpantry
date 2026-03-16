@@ -9,6 +9,7 @@ firebase_admin.initialize_app(cred)
 db = firestore.client()
 
 app = Flask(__name__)
+app.register_blueprint(create_pantries_blueprint(db))
 
 
 def _as_diet_document(entry):
