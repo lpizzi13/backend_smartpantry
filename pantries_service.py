@@ -26,6 +26,50 @@ OFF_SEARCH_MAX_RETRIES = 1
 OFF_BARCODE_MAX_RETRIES = OFF_MAX_RETRIES
 OFF_SEARCH_URL = "https://search.openfoodfacts.org/search"
 OFF_LEGACY_SEARCH_URL = "https://world.openfoodfacts.org/cgi/search.pl"
+OFF_SEARCH_SORT_BY = "-completeness"
+OFF_SEARCH_QUALITY_CONSTRAINTS: Tuple[str, ...] = (
+    'states_tags:"en:nutrition-facts-completed"',
+    "nutriments.energy-kcal_100g:[1 TO *]",
+    "nutriments.carbohydrates_100g:[0.1 TO *]",
+    "nutriments.proteins_100g:[0.1 TO *]",
+    "nutriments.fat_100g:[0.1 TO *]",
+)
+# Producer/source indicators used to infer OFF data trustworthiness.
+OFF_PRODUCER_SOURCE_KEYWORDS: Tuple[str, ...] = (
+    "producer",
+    "producers",
+    "producer-",
+    "manufacturer",
+    "manufacturers",
+    "brand-owner",
+    "brand_owner",
+)
+OFF_REVIEWED_STATES = {"en:checked", "en:complete"}
+OFF_CERTIFIED_MIN_COMPLETENESS = 0.9
+OFF_SEARCH_RESPONSE_FIELDS: Tuple[str, ...] = (
+    "code",
+    "product_name",
+    # Language fallback fields for display quality.
+    "generic_name",
+    "brands",
+    "brands_tags",
+    # Producer/source metadata used for "certified" signal.
+    "owner",
+    "owners_tags",
+    "data_sources_tags",
+    # Package weight metadata for frontend display.
+    "quantity",
+    "product_quantity",
+    "product_quantity_unit",
+    # Lightweight macro fields (avoid full nutriments payload in search).
+    "energy-kcal_100g",
+    "carbohydrates_100g",
+    "proteins_100g",
+    "fat_100g",
+    # OFF quality metadata used for ranking.
+    "states_tags",
+    "completeness",
+)
 OFF_DEFAULT_HEADERS = {
     "User-Agent": "SmartPantryBackend/1.0 (smartpantry@localhost)",
     "Accept": "application/json",
@@ -102,50 +146,47 @@ class PantriesService:
         lang: str = "it",
     ) -> List[Dict[str, Any]]:
         page_size = min(max(limit, 20), MAX_SEARCH_LIMIT)
+        filtered_query = self._build_off_quality_search_query(query)
+        langs = self._build_off_search_langs(lang)
+        legacy_langs = self._build_off_legacy_search_langs(lang)
         search_fields = ",".join(
             [
-                "code",
-                "product_name",
+                *OFF_SEARCH_RESPONSE_FIELDS,
                 f"product_name_{lang}",
-                "generic_name",
                 f"generic_name_{lang}",
-                "brands",
-                "brands_tags",
-                # Package weight metadata.
-                "quantity",
-                "product_quantity",
-                "product_quantity_unit",
-                # Needed to prefill macros on frontend search results.
-                "nutriments",
-                "energy-kcal_100g",
-                "carbohydrates_100g",
-                "proteins_100g",
-                "fat_100g",
+                "product_name_en",
+                "generic_name_en",
             ]
         )
         search_backends = [
             {
                 "url": OFF_SEARCH_URL,
                 "params": {
-                    "q": query,
+                    "q": filtered_query,
                     "page_size": page_size,
                     "fields": search_fields,
+                    "langs": langs,
+                    "sort_by": OFF_SEARCH_SORT_BY,
                 },
                 "timeout": OFF_SEARCH_TIMEOUT,
-            },
-            {
-                "url": OFF_LEGACY_SEARCH_URL,
-                "params": {
-                    "search_terms": query,
-                    "search_simple": 1,
-                    "action": "process",
-                    "json": 1,
-                    "page_size": page_size,
-                    "lc": lang,
-                },
-                "timeout": OFF_LEGACY_SEARCH_TIMEOUT,
-            },
+            }
         ]
+        for legacy_lang in legacy_langs:
+            search_backends.append(
+                {
+                    "url": OFF_LEGACY_SEARCH_URL,
+                    "params": {
+                        "search_terms": query,
+                        "search_simple": 1,
+                        "action": "process",
+                        "json": 1,
+                        "page_size": page_size,
+                        "lc": legacy_lang,
+                        "fields": search_fields,
+                    },
+                    "timeout": OFF_LEGACY_SEARCH_TIMEOUT,
+                }
+            )
 
         last_exception: Optional[PantriesError] = None
         for backend in search_backends:
@@ -168,12 +209,67 @@ class PantriesService:
                 self._map_off_search_product(product=p, preferred_lang=lang)
                 for p in products
             ]
+            normalized_products = self._sort_search_products_for_certification(
+                normalized_products
+            )
             self._cache_off_search_products(products, preferred_lang=lang)
             return normalized_products
 
         if last_exception is not None:
             raise last_exception
         return []
+
+    @staticmethod
+    def _build_off_quality_search_query(query: str) -> str:
+        normalized_query = PantriesService._normalize_text(query)
+        if not normalized_query:
+            return ""
+        return " AND ".join(
+            [normalized_query, *OFF_SEARCH_QUALITY_CONSTRAINTS]
+        )
+
+    @staticmethod
+    def _build_off_search_langs(lang: str) -> str:
+        preferred = PantriesService._normalize_text(lang).lower() or "en"
+        ordered_langs = [preferred]
+        if preferred != "en":
+            ordered_langs.append("en")
+        return ",".join(ordered_langs)
+
+    @staticmethod
+    def _build_off_legacy_search_langs(lang: str) -> List[str]:
+        preferred = PantriesService._normalize_text(lang).lower() or "en"
+        ordered_langs = [preferred]
+        if preferred != "en":
+            ordered_langs.append("en")
+        return ordered_langs
+
+    @staticmethod
+    def _sort_search_products_for_certification(
+        products: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        indexed_products = list(enumerate(products))
+
+        def _sort_key(item: Tuple[int, Dict[str, Any]]) -> Tuple[int, float, float, int]:
+            original_index, product = item
+            certified = 1 if bool(product.get("certified")) else 0
+            certification = (
+                product.get("certification")
+                if isinstance(product.get("certification"), dict)
+                else {}
+            )
+            certification_score = PantriesService._parse_non_negative_float(
+                certification.get("score")
+            )
+            completeness = PantriesService._parse_non_negative_float(
+                product.get("completeness")
+            )
+            score = certification_score if certification_score is not None else 0.0
+            completeness_score = completeness if completeness is not None else 0.0
+            return (-certified, -score, -completeness_score, original_index)
+
+        indexed_products.sort(key=_sort_key)
+        return [product for _, product in indexed_products]
 
     def get_open_food_facts_product(self, barcode: str) -> Dict[str, Any]:
         normalized_barcode = self._normalize_barcode(barcode)
@@ -719,6 +815,184 @@ class PantriesService:
         return False
 
     @staticmethod
+    def _extract_off_tags(value: Any) -> List[str]:
+        if isinstance(value, list):
+            normalized = [
+                PantriesService._normalize_text(item)
+                for item in value
+                if PantriesService._normalize_text(item)
+            ]
+            if normalized:
+                return normalized
+
+        single_value = PantriesService._normalize_text(value)
+        if not single_value:
+            return []
+        if "," in single_value:
+            return [
+                token.strip()
+                for token in single_value.split(",")
+                if PantriesService._normalize_text(token)
+            ]
+        return [single_value]
+
+    @staticmethod
+    def _extract_off_owner(product: Dict[str, Any]) -> str:
+        direct_owner = PantriesService._normalize_text(product.get("owner"))
+        if direct_owner:
+            return direct_owner
+
+        owner_tags = PantriesService._extract_off_owners_tags(product)
+        if owner_tags:
+            return owner_tags[0]
+        return ""
+
+    @staticmethod
+    def _extract_off_owners_tags(product: Dict[str, Any]) -> List[str]:
+        return PantriesService._extract_off_tags(product.get("owners_tags"))
+
+    @staticmethod
+    def _extract_off_data_sources(product: Dict[str, Any]) -> str:
+        return PantriesService._normalize_text(product.get("data_sources"))
+
+    @staticmethod
+    def _extract_off_data_sources_tags(product: Dict[str, Any]) -> List[str]:
+        return PantriesService._extract_off_tags(product.get("data_sources_tags"))
+
+    @staticmethod
+    def _build_off_certification_payload(
+        brands: str,
+        brands_tags: List[str],
+        owner: str,
+        owners_tags: List[str],
+        data_sources_tags: List[str],
+        states_tags: List[str],
+        completeness: Optional[float],
+        via_barcode: bool,
+    ) -> Dict[str, Any]:
+        normalized_brands = PantriesService._normalize_search_text(
+            " ".join([brands, *brands_tags])
+        )
+        normalized_owner = PantriesService._normalize_search_text(
+            " ".join([owner, *owners_tags])
+        )
+        normalized_sources = [
+            PantriesService._normalize_search_text(tag)
+            for tag in data_sources_tags
+        ]
+        normalized_states = [
+            PantriesService._normalize_search_text(tag) for tag in states_tags
+        ]
+        # Legacy key kept for backward compatibility with existing frontend checks.
+        # It now represents "brand metadata available", not a brand-name whitelist match.
+        brand_matched = bool(normalized_brands)
+        # Any explicit owner/owner-tag counts as producer identity signal.
+        owner_matched = bool(normalized_owner)
+        producer_source_matched = any(
+            any(keyword in source_tag for keyword in OFF_PRODUCER_SOURCE_KEYWORDS)
+            for source_tag in normalized_sources
+        )
+        state_reviewed_matched = any(
+            state_tag in OFF_REVIEWED_STATES for state_tag in normalized_states
+        )
+        completeness_matched = (
+            completeness is not None
+            and completeness >= OFF_CERTIFIED_MIN_COMPLETENESS
+        )
+        producer_identity_matched = owner_matched or producer_source_matched
+        quality_matched = (
+            state_reviewed_matched
+            or completeness_matched
+            or (not normalized_states and completeness is None)
+        )
+        is_certified = bool(
+            producer_identity_matched and (quality_matched or via_barcode)
+        )
+        score = 0
+        if brand_matched:
+            score += 5
+        if owner_matched:
+            score += 35
+        if producer_source_matched:
+            score += 35
+        if state_reviewed_matched:
+            score += 10
+        if completeness_matched:
+            score += 10
+        if via_barcode:
+            score += 10
+        certification_score = float(min(score, 100))
+
+        reasons: List[str] = []
+        if brand_matched:
+            reasons.append("brand_match")
+        if owner_matched:
+            reasons.append("owner_match")
+        if producer_source_matched:
+            reasons.append("producer_source_match")
+        if state_reviewed_matched:
+            reasons.append("state_reviewed_match")
+        if completeness_matched:
+            reasons.append("completeness_match")
+        if via_barcode:
+            reasons.append("barcode_lookup")
+
+        return {
+            "isCertified": is_certified,
+            "likelyOriginal": is_certified,
+            "brandMatched": brand_matched,
+            "ownerMatched": owner_matched,
+            "producerSourceMatched": producer_source_matched,
+            "stateReviewedMatched": state_reviewed_matched,
+            "completenessMatched": completeness_matched,
+            "score": certification_score,
+            "viaBarcodeLookup": bool(via_barcode),
+            "confidence": "high" if is_certified else "none",
+            "reasons": reasons,
+        }
+
+    @staticmethod
+    def _apply_off_certification_metadata(
+        mapped_product: Dict[str, Any],
+        raw_product: Dict[str, Any],
+        via_barcode: bool = False,
+    ) -> None:
+        brands_tags = PantriesService._extract_off_tags(raw_product.get("brands_tags"))
+        owner = PantriesService._extract_off_owner(raw_product)
+        owners_tags = PantriesService._extract_off_owners_tags(raw_product)
+        data_sources = PantriesService._extract_off_data_sources(raw_product)
+        data_sources_tags = PantriesService._extract_off_data_sources_tags(raw_product)
+
+        if brands_tags:
+            mapped_product["brands_tags"] = brands_tags
+        if owner:
+            mapped_product["owner"] = owner
+        if owners_tags:
+            mapped_product["owners_tags"] = owners_tags
+        if data_sources:
+            mapped_product["data_sources"] = data_sources
+        if data_sources_tags:
+            mapped_product["data_sources_tags"] = data_sources_tags
+        states_tags = PantriesService._extract_off_tags(raw_product.get("states_tags"))
+        completeness = PantriesService._parse_non_negative_float(
+            raw_product.get("completeness")
+        )
+
+        certification = PantriesService._build_off_certification_payload(
+            brands=PantriesService._normalize_text(mapped_product.get("brands")),
+            brands_tags=brands_tags,
+            owner=owner,
+            owners_tags=owners_tags,
+            data_sources_tags=data_sources_tags,
+            states_tags=states_tags,
+            completeness=completeness,
+            via_barcode=via_barcode,
+        )
+        mapped_product["certification"] = certification
+        mapped_product["certified"] = certification["isCertified"]
+        mapped_product["likelyOriginal"] = certification["likelyOriginal"]
+
+    @staticmethod
     def _map_off_product(product: Dict[str, Any]) -> Dict[str, Any]:
         mapped = {
             "openFoodFactsId": PantriesService._normalize_text(product.get("code")),
@@ -734,6 +1008,11 @@ class PantriesService:
         package_weight_grams = PantriesService._extract_off_package_weight_grams(product)
         if package_weight_grams is not None:
             mapped["packageWeightGrams"] = package_weight_grams
+        PantriesService._apply_off_certification_metadata(
+            mapped_product=mapped,
+            raw_product=product,
+            via_barcode=True,
+        )
         return mapped
 
     @staticmethod
@@ -748,6 +1027,23 @@ class PantriesService:
             ),
             "brands": PantriesService._extract_off_brands(product),
         }
+        completeness = PantriesService._parse_non_negative_float(
+            product.get("completeness")
+        )
+        if completeness is not None:
+            mapped["completeness"] = completeness
+        states_tags = product.get("states_tags")
+        if isinstance(states_tags, list):
+            normalized_states = [
+                PantriesService._normalize_text(state) for state in states_tags
+            ]
+            mapped["states_tags"] = [state for state in normalized_states if state]
+        PantriesService._apply_off_certification_metadata(
+            mapped_product=mapped,
+            raw_product=product,
+            via_barcode=False,
+        )
+
         package_weight_grams = PantriesService._extract_off_package_weight_grams(product)
         if package_weight_grams is not None:
             mapped["packageWeightGrams"] = package_weight_grams

@@ -64,27 +64,9 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
         _log_backend("IN", "/pantry/barcode", {"barcode": barcode})
         try:
             result = pantries_service.get_open_food_facts_product(barcode)
-            nutrient_payload = _build_client_nutrient_payload(result.get("nutrients"))
-            compatible_product = {
-                "code": result.get("openFoodFactsId", ""),
-                "product_name": result.get("productName", ""),
-                "openFoodFactsId": result.get("openFoodFactsId", ""),
-                "productName": result.get("productName", ""),
-                "brands": result.get("brands", ""),
-                "imageUrl": result.get("imageUrl", ""),
-                "nutrients": nutrient_payload["nutrients"],
-                "kcal": nutrient_payload["kcal"],
-                "carbs": nutrient_payload["carbs"],
-                "fat": nutrient_payload["fat"],
-                "prot": nutrient_payload["prot"],
-                "protein": nutrient_payload["protein"],
-                "nutriments": nutrient_payload["nutriments"],
-            }
-            package_weight_grams = _extract_package_weight_grams(result)
-            if package_weight_grams is not None:
-                compatible_product["packageWeightGrams"] = package_weight_grams
-                compatible_product["package_weight_grams"] = package_weight_grams
-                compatible_product["product_quantity"] = package_weight_grams
+            compatible_product = _normalize_search_product_for_client(result)
+            # Barcode lookup is an exact product-code match, not a generic text match.
+            compatible_product["barcodeVerified"] = True
             response_payload = {"status": 1, "product": compatible_product}
             _log_backend(
                 "OUT",
@@ -202,47 +184,70 @@ def _normalize_pantry_item_for_client(item: Dict[str, Any]) -> Dict[str, Any]:
         response_payload["kcal"] = nutrient_payload["kcal"]
         response_payload["carbs"] = nutrient_payload["carbs"]
         response_payload["fat"] = nutrient_payload["fat"]
-        response_payload["prot"] = nutrient_payload["prot"]
         response_payload["protein"] = nutrient_payload["protein"]
-        response_payload["nutrients"] = nutrient_payload["nutrients"]
 
     package_weight_grams = _extract_package_weight_grams(item)
     if package_weight_grams is not None:
         response_payload["packageWeightGrams"] = package_weight_grams
-        response_payload["package_weight_grams"] = package_weight_grams
     return response_payload
 
 
 def _normalize_search_product_for_client(product: Dict[str, Any]) -> Dict[str, Any]:
-    normalized = dict(product if isinstance(product, dict) else {})
-    code = str(normalized.get("code") or normalized.get("openFoodFactsId") or "").strip()
-    product_name = (
-        str(normalized.get("product_name") or normalized.get("productName") or "").strip()
-    )
+    normalized_input = dict(product if isinstance(product, dict) else {})
+    normalized: Dict[str, Any] = {}
+    code = str(
+        normalized_input.get("openFoodFactsId") or normalized_input.get("code") or ""
+    ).strip()
+    product_name = str(
+        normalized_input.get("productName") or normalized_input.get("product_name") or ""
+    ).strip()
     if code:
-        normalized["code"] = code
         normalized["openFoodFactsId"] = code
     if product_name:
-        normalized["product_name"] = product_name
         normalized["productName"] = product_name
 
+    brands = str(normalized_input.get("brands") or "").strip()
+    if brands:
+        normalized["brands"] = brands
+
+    image_url = str(normalized_input.get("imageUrl") or "").strip()
+    if image_url:
+        normalized["imageUrl"] = image_url
+
     nutrient_payload = _build_client_nutrient_payload(
-        normalized.get("nutrients") or normalized.get("nutriments") or normalized
+        normalized_input.get("nutrients")
+        or normalized_input.get("nutriments")
+        or normalized_input
     )
     if _has_non_zero_nutrients(nutrient_payload["nutrients"]):
         normalized["kcal"] = nutrient_payload["kcal"]
         normalized["carbs"] = nutrient_payload["carbs"]
         normalized["fat"] = nutrient_payload["fat"]
-        normalized["prot"] = nutrient_payload["prot"]
         normalized["protein"] = nutrient_payload["protein"]
-        normalized["nutrients"] = nutrient_payload["nutrients"]
-        normalized["nutriments"] = nutrient_payload["nutriments"]
-
-    package_weight_grams = _extract_package_weight_grams(normalized)
+    package_weight_grams = _extract_package_weight_grams(normalized_input)
     if package_weight_grams is not None:
         normalized["packageWeightGrams"] = package_weight_grams
-        normalized["package_weight_grams"] = package_weight_grams
-        normalized["product_quantity"] = package_weight_grams
+
+    optional_passthrough = (
+        "completeness",
+        "states_tags",
+        "brands_tags",
+        "owner",
+        "owners_tags",
+        "data_sources_tags",
+        "certification",
+    )
+    for key in optional_passthrough:
+        value = normalized_input.get(key)
+        if value is not None:
+            normalized[key] = value
+
+    if "certified" in normalized_input:
+        normalized["certified"] = bool(normalized_input.get("certified"))
+    if "likelyOriginal" in normalized_input:
+        normalized["likelyOriginal"] = bool(normalized_input.get("likelyOriginal"))
+    if "barcodeVerified" in normalized_input:
+        normalized["barcodeVerified"] = bool(normalized_input.get("barcodeVerified"))
     return normalized
 
 
@@ -282,19 +287,12 @@ def _build_client_nutrient_payload(raw_nutrients: Any) -> Dict[str, Any]:
         "kcal": kcal,
         "carbs": carbs,
         "fat": fat,
-        "prot": protein,
         "protein": protein,
         "nutrients": {
             "kcal": kcal,
             "carbs": carbs,
             "fat": fat,
             "protein": protein,
-        },
-        "nutriments": {
-            "energy-kcal_100g": kcal,
-            "carbohydrates_100g": carbs,
-            "fat_100g": fat,
-            "proteins_100g": protein,
         },
     }
 
