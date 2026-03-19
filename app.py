@@ -352,17 +352,61 @@ def get_diet():
             diet_item["duid"] = diet_id
             diets.append(_serialize_firestore_value(diet_item))
 
-        if diets:
-            diet_payload = {
-                "diets": diets,
-                "selectedDietId": selected_diet_id
-            }
-            return jsonify({
-                "status": "success",
-                "diets": diets,
-                "dietData": diet_payload
-            }), 200
+        diet_payload = {
+            "diets": diets,
+            "selectedDietId": selected_diet_id
+        }
+        return jsonify({
+            "status": "success",
+            "diets": diets,
+            "dietData": diet_payload
+        }), 200
 
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/delete-diet', methods=['POST'])
+def delete_diet():
+    data = request.json or {}
+    uid = data.get('uid')
+    diet_id = data.get('duid') or data.get('diud')
+
+    if not uid:
+        return jsonify({"error": "UID mancante"}), 400
+
+    if not diet_id:
+        return jsonify({"error": "DUID mancante"}), 400
+
+    try:
+        user_ref = db.collection('users').document(uid)
+        user_doc = user_ref.get()
+
+        if not user_doc.exists:
+            return jsonify({"error": "Utente non trovato"}), 404
+
+        diet_ref = user_ref.collection("diets").document(diet_id)
+        diet_doc = diet_ref.get()
+
+        if not diet_doc.exists:
+            return jsonify({"error": "Dieta non trovata"}), 404
+
+        user_data = user_doc.to_dict() or {}
+        selected_diet_id = user_data.get("selectedDietId")
+
+        batch = db.batch()
+        batch.delete(diet_ref)
+
+        if selected_diet_id == diet_id:
+            selected_diet_id = None
+            batch.set(user_ref, {"selectedDietId": None}, merge=True)
+
+        batch.commit()
+
+        return jsonify({
+            "status": "success",
+            "deletedDietId": diet_id,
+            "selectedDietId": selected_diet_id
+        }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
