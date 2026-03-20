@@ -55,6 +55,8 @@ OFF_SEARCH_RESPONSE_FIELDS: Tuple[str, ...] = (
     "brands_tags",
     # Producer/source metadata used for "certified" signal.
     "owner",
+    "brand_owner",
+    "brand_owner_imported",
     "owners_tags",
     "data_sources_tags",
     # Package weight metadata for frontend display.
@@ -62,6 +64,7 @@ OFF_SEARCH_RESPONSE_FIELDS: Tuple[str, ...] = (
     "product_quantity",
     "product_quantity_unit",
     # Lightweight macro fields (avoid full nutriments payload in search).
+    "nutriments",
     "energy-kcal_100g",
     "carbohydrates_100g",
     "proteins_100g",
@@ -116,11 +119,8 @@ class PantriesService:
             else:
                 raise
 
-        fallback_products = self.search_firestore_products(
-            query=validated_query,
-            limit=max(validated_limit * 2, 20),
-        )
-        products = self._merge_search_products(off_products, fallback_products)
+        # Search responses are intentionally sourced only from OpenFoodFacts.
+        products = off_products
 
         if not products and off_exception is not None:
             raise off_exception
@@ -838,9 +838,15 @@ class PantriesService:
 
     @staticmethod
     def _extract_off_owner(product: Dict[str, Any]) -> str:
-        direct_owner = PantriesService._normalize_text(product.get("owner"))
-        if direct_owner:
-            return direct_owner
+        direct_owner_fields = (
+            "owner",
+            "brand_owner",
+            "brand_owner_imported",
+        )
+        for field in direct_owner_fields:
+            direct_owner = PantriesService._normalize_text(product.get(field))
+            if direct_owner:
+                return direct_owner
 
         owner_tags = PantriesService._extract_off_owners_tags(product)
         if owner_tags:
