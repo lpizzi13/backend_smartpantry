@@ -269,11 +269,11 @@ def save_diet():
     uid = data.get('uid')
     diet_data = data.get('dietData')
 
-    if not uid:
+    if uid is None:
         return jsonify({"error": "UID mancante"}), 400
 
     if diet_data is None:
-        return jsonify({"error": "dietData mancante"}), 400
+        return jsonify({"error": "dietData mancante"}), 401
 
 
     try:
