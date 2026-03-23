@@ -106,25 +106,35 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
         except Exception as exc:
             return _handle_error(exc)
 
+    @pantries_bp.route("/pantry/grams", methods=["PATCH"])
     @pantries_bp.route("/pantry/quantity", methods=["PATCH"])
-    def set_item_quantity() -> Tuple[Any, int]:
+    def set_item_grams() -> Tuple[Any, int]:
         payload = _get_json_payload()
-        _log_backend("IN", "/pantry/quantity", _compact_request_payload(payload))
+        endpoint = request.path
+        _log_backend("IN", endpoint, _compact_request_payload(payload))
         try:
-            result = pantries_service.set_item_quantity(
+            grams_payload = _extract_grams_payload(payload)
+            if grams_payload is None:
+                grams_payload = _calculate_total_grams_from_payload(payload)
+            if grams_payload is None:
+                raise PantriesError(
+                    "grams obbligatorio (oppure quantity + packageWeightGrams)",
+                    status_code=400,
+                )
+            result = pantries_service.set_item_grams(
                 uid=payload.get("uid"),
                 open_food_facts_id=payload.get("openFoodFactsId"),
-                quantity=payload.get("quantity"),
+                grams=grams_payload,
                 product_name=payload.get("productName"),
                 nutrients=_extract_nutrients_payload(payload),
-                package_weight_grams=_extract_package_weight_payload(payload),
+                require_existing=True,
             )
             item_payload = _normalize_pantry_item_for_client(result)
             item_payload["deleted"] = bool(result.get("deleted"))
-            status_code = 201 if result.get("created") else 200
+            status_code = 200
             _log_backend(
                 "OUT",
-                "/pantry/quantity",
+                endpoint,
                 {"status": "success", "item": _compact_product_payload(item_payload)},
             )
             return jsonify({"status": "success", "item": item_payload}), status_code
@@ -173,11 +183,44 @@ def _extract_package_weight_payload(payload: Dict[str, Any]) -> Any:
     return None
 
 
+def _extract_grams_payload(payload: Dict[str, Any]) -> Optional[float]:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("grams", "totalGrams", "total_grams"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            parsed = float(value)
+            if parsed >= 0:
+                return parsed
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _calculate_total_grams_from_payload(payload: Dict[str, Any]) -> Optional[float]:
+    if not isinstance(payload, dict):
+        return None
+    quantity = payload.get("quantity")
+    package_weight_grams = _extract_package_weight_payload(payload)
+    if quantity is None or package_weight_grams is None:
+        return None
+    try:
+        parsed_quantity = float(quantity)
+        parsed_weight = float(package_weight_grams)
+    except (TypeError, ValueError):
+        return None
+    if parsed_quantity < 0 or parsed_weight < 0:
+        return None
+    return round(parsed_quantity * parsed_weight, 3)
+
+
 def _normalize_pantry_item_for_client(item: Dict[str, Any]) -> Dict[str, Any]:
     response_payload = {
         "openFoodFactsId": item.get("openFoodFactsId", ""),
         "productName": item.get("productName", ""),
-        "quantity": item.get("quantity", 0),
+        "grams": _extract_grams_payload(item) or 0.0,
     }
     nutrient_payload = _build_client_nutrient_payload(item.get("nutrients"))
     if _has_non_zero_nutrients(nutrient_payload["nutrients"]):
@@ -185,10 +228,6 @@ def _normalize_pantry_item_for_client(item: Dict[str, Any]) -> Dict[str, Any]:
         response_payload["carbs"] = nutrient_payload["carbs"]
         response_payload["fat"] = nutrient_payload["fat"]
         response_payload["protein"] = nutrient_payload["protein"]
-
-    package_weight_grams = _extract_package_weight_grams(item)
-    if package_weight_grams is not None:
-        response_payload["packageWeightGrams"] = package_weight_grams
     return response_payload
 
 
@@ -335,6 +374,7 @@ def _compact_product_payload(product: Dict[str, Any]) -> Dict[str, Any]:
     compact = {
         "openFoodFactsId": product.get("openFoodFactsId") or product.get("code"),
         "productName": product.get("productName") or product.get("product_name"),
+        "grams": _extract_grams_payload(product),
         "quantity": product.get("quantity"),
         "kcal": macros["kcal"],
         "carbs": macros["carbs"],
@@ -355,6 +395,7 @@ def _compact_request_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "uid": payload.get("uid"),
         "openFoodFactsId": payload.get("openFoodFactsId"),
         "productName": payload.get("productName"),
+        "grams": _extract_grams_payload(payload),
         "quantity": payload.get("quantity"),
         "kcal": macros["kcal"],
         "carbs": macros["carbs"],
