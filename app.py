@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, firestore, auth
+from home_routes import create_home_blueprint
 from pantries_routes import create_pantries_blueprint
 
 # 1. Inizializzazione Firebase
@@ -10,6 +11,7 @@ db = firestore.client()
 
 app = Flask(__name__)
 app.register_blueprint(create_pantries_blueprint(db))
+app.register_blueprint(create_home_blueprint(db))
 
 #Non so se strettamente necessaria
 def _serialize_firestore_value(value):
