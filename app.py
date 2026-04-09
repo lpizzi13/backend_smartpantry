@@ -1,7 +1,14 @@
+import math
+import re
+import unicodedata
+from difflib import SequenceMatcher
+from typing import Any, Dict, List, Optional, Tuple
+
 from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, firestore, auth
 from pantries_routes import create_pantries_blueprint
+from pantries_service import PantriesService
 
 # 1. Inizializzazione Firebase
 cred = credentials.Certificate("serviceAccountKey.json")
@@ -10,6 +17,7 @@ db = firestore.client()
 
 app = Flask(__name__)
 app.register_blueprint(create_pantries_blueprint(db))
+pantries_service = PantriesService(db)
 
 #Non so se strettamente necessaria
 def _serialize_firestore_value(value):
@@ -21,6 +29,268 @@ def _serialize_firestore_value(value):
     if isinstance(value, dict):
         return {k: _serialize_firestore_value(v) for k, v in value.items()}
     return value
+
+
+MEAL_KEYS = ("breakfast", "lunch", "dinner", "snacks")
+STOPWORDS = {
+    "di",
+    "del",
+    "della",
+    "dello",
+    "degli",
+    "delle",
+    "con",
+    "al",
+    "alla",
+    "allo",
+    "ai",
+    "agli",
+    "all",
+    "da",
+    "dal",
+    "dai",
+    "dalla",
+    "dalle",
+}
+
+
+def _normalize_food_name(value: Any) -> str:
+    if value is None:
+        return ""
+    normalized = unicodedata.normalize("NFKD", str(value))
+    no_accents = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    lowered = no_accents.strip().lower()
+    lowered = re.sub(r"[^a-z0-9\s]+", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def _tokenize_food_name(value: Any) -> List[str]:
+    normalized = _normalize_food_name(value)
+    if not normalized:
+        return []
+    return [
+        token
+        for token in normalized.split(" ")
+        if token and token not in STOPWORDS and len(token) > 1
+    ]
+
+
+def _parse_non_negative_float(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(str(value).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return round(parsed, 3)
+
+
+def _extract_diet_requirements(diet_payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    requirements: Dict[str, Dict[str, Any]] = {}
+    days = diet_payload.get("days")
+    if not isinstance(days, list):
+        return requirements
+
+    for day in days:
+        if not isinstance(day, dict):
+            continue
+        for meal_key in MEAL_KEYS:
+            items = day.get(meal_key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                raw_name = item.get("name")
+                name = str(raw_name).strip() if raw_name is not None else ""
+                if not name:
+                    continue
+                normalized_name = _normalize_food_name(name)
+                if not normalized_name:
+                    continue
+
+                quantity = _parse_non_negative_float(item.get("quantity"))
+                if quantity is None or quantity <= 0:
+                    continue
+
+                if normalized_name not in requirements:
+                    requirements[normalized_name] = {
+                        "name": name,
+                        "requiredGrams": 0.0,
+                    }
+                requirements[normalized_name]["requiredGrams"] = round(
+                    requirements[normalized_name]["requiredGrams"] + quantity, 3
+                )
+    return requirements
+
+
+def _build_pantry_stock(uid: str) -> List[Dict[str, Any]]:
+    pantry_items = pantries_service.list_items(uid=uid)
+    stock: List[Dict[str, Any]] = []
+    for item in pantry_items:
+        grams = _parse_non_negative_float(item.get("grams"))
+        if grams is None or grams <= 0:
+            continue
+        product_name = str(item.get("productName") or "").strip()
+        if not product_name:
+            continue
+        stock.append(
+            {
+                "productName": product_name,
+                "remainingGrams": grams,
+            }
+        )
+    return stock
+
+
+def _name_match_score(diet_name: str, pantry_name: str) -> float:
+    normalized_diet = _normalize_food_name(diet_name)
+    normalized_pantry = _normalize_food_name(pantry_name)
+    if not normalized_diet or not normalized_pantry:
+        return 0.0
+    if normalized_diet == normalized_pantry:
+        return 1.0
+
+    score = 0.0
+    shorter_len = min(len(normalized_diet), len(normalized_pantry))
+    if shorter_len >= 4 and (
+        normalized_diet in normalized_pantry or normalized_pantry in normalized_diet
+    ):
+        score = max(score, 0.88)
+
+    diet_tokens = set(_tokenize_food_name(normalized_diet))
+    pantry_tokens = set(_tokenize_food_name(normalized_pantry))
+    if diet_tokens and pantry_tokens:
+        common_tokens = diet_tokens.intersection(pantry_tokens)
+        overlap = len(common_tokens) / len(diet_tokens)
+        if overlap >= 1.0:
+            score = max(score, 0.95)
+        elif overlap >= 0.75:
+            score = max(score, 0.85)
+        elif overlap >= 0.5 and len(common_tokens) >= 2:
+            score = max(score, 0.78)
+
+    ratio = SequenceMatcher(None, normalized_diet, normalized_pantry).ratio()
+    score = max(score, ratio)
+    if score < 0.78:
+        return 0.0
+    return score
+
+
+def _consume_matching_stock(
+    pantry_stock: List[Dict[str, Any]], diet_name: str, required_grams: float
+) -> float:
+    candidates: List[Tuple[int, float]] = []
+    for index, pantry_item in enumerate(pantry_stock):
+        score = _name_match_score(diet_name, pantry_item.get("productName", ""))
+        if score > 0:
+            candidates.append((index, score))
+
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    remaining = required_grams
+    consumed = 0.0
+    for candidate_index, _ in candidates:
+        if remaining <= 0:
+            break
+        available = pantry_stock[candidate_index].get("remainingGrams", 0.0)
+        if available <= 0:
+            continue
+        taken = min(available, remaining)
+        pantry_stock[candidate_index]["remainingGrams"] = round(available - taken, 3)
+        consumed = round(consumed + taken, 3)
+        remaining = round(remaining - taken, 3)
+    return consumed
+
+
+def _format_quantity_grams(grams: float) -> str:
+    rounded = round(grams, 3)
+    if abs(rounded - int(rounded)) < 0.001:
+        return f"{int(rounded)} g"
+    return f"{rounded:g} g"
+
+
+def _generate_shopping_list_items(uid: str, selected_diet_id: str) -> List[Dict[str, Any]]:
+    user_ref = db.collection("users").document(uid)
+    diet_doc = user_ref.collection("diets").document(selected_diet_id).get()
+    if not diet_doc.exists:
+        raise LookupError("Dieta non trovata")
+
+    diet_payload = diet_doc.to_dict() or {}
+    requirements = _extract_diet_requirements(diet_payload)
+    pantry_stock = _build_pantry_stock(uid)
+
+    missing_items: List[Dict[str, Any]] = []
+    for requirement in requirements.values():
+        food_name = requirement.get("name", "")
+        required_grams = _parse_non_negative_float(requirement.get("requiredGrams")) or 0.0
+        if required_grams <= 0:
+            continue
+
+        available_grams = _consume_matching_stock(
+            pantry_stock=pantry_stock,
+            diet_name=food_name,
+            required_grams=required_grams,
+        )
+        missing_grams = max(required_grams - available_grams, 0.0)
+        if missing_grams > 0.001:
+            missing_items.append(
+                {
+                    "name": food_name,
+                    "quantity": _format_quantity_grams(missing_grams),
+                    "isChecked": False,
+                }
+            )
+
+    # Rimuove duplicati mantenendo ordine.
+    deduped: List[Dict[str, Any]] = []
+    seen_names = set()
+    for item in missing_items:
+        key = _normalize_food_name(item.get("name"))
+        if key in seen_names:
+            continue
+        seen_names.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _shopping_list_collection(uid: str) -> Any:
+    return db.collection("users").document(uid).collection("shopping_list")
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y"}:
+            return True
+        if normalized in {"false", "0", "no", "n", ""}:
+            return False
+    return default
+
+
+def _normalize_shopping_item(raw_item: Any, index: int = 0) -> Dict[str, Any]:
+    if not isinstance(raw_item, dict):
+        raise ValueError(f"Elemento shoppingList non valido in posizione {index}")
+
+    name = str(raw_item.get("name") or raw_item.get("nome") or "").strip()
+    if not name:
+        raise ValueError(f"name mancante nell'elemento shoppingList in posizione {index}")
+
+    quantity_raw = raw_item.get("quantity")
+    if quantity_raw is None:
+        quantity_raw = raw_item.get("grammatura")
+    quantity = str(quantity_raw).strip() if quantity_raw is not None else ""
+
+    return {
+        "name": name,
+        "quantity": quantity,
+        "isChecked": _coerce_bool(raw_item.get("isChecked"), default=False),
+    }
 
 @app.route('/get-user-data', methods=['POST'])
 def get_user_data():
@@ -407,6 +677,143 @@ def delete_diet():
             "deletedDietId": diet_id,
             "selectedDietId": selected_diet_id
         }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/generate_shopping_list', methods=['POST'])
+def generate_shopping_list():
+    data = request.json or {}
+    uid = str(data.get("uid") or "").strip()
+    selected_diet_id = str(data.get("selectedDietId") or "").strip()
+
+    if not uid:
+        return jsonify({"error": "UID mancante"}), 400
+    if not selected_diet_id:
+        return jsonify({"error": "selectedDietId mancante"}), 400
+
+    try:
+        user_doc = db.collection("users").document(uid).get()
+        if not user_doc.exists:
+            return jsonify({"error": "Utente non trovato"}), 404
+
+        shopping_list = _generate_shopping_list_items(
+            uid=uid,
+            selected_diet_id=selected_diet_id,
+        )
+
+        return jsonify(shopping_list), 200
+    except LookupError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/get_shopping_list', methods=['POST'])
+def get_shopping_list():
+    data = request.json or {}
+    uid = str(data.get("uid") or "").strip()
+
+    if not uid:
+        return jsonify({"error": "UID mancante"}), 400
+
+    try:
+        user_doc = db.collection("users").document(uid).get()
+        if not user_doc.exists:
+            return jsonify({"error": "Utente non trovato"}), 404
+
+        docs = _shopping_list_collection(uid).stream()
+        shopping_list: List[Dict[str, Any]] = []
+        for doc in docs:
+            payload = doc.to_dict() or {}
+            item_name = str(payload.get("name") or payload.get("nome") or doc.id).strip()
+            if not item_name:
+                continue
+
+            quantity_raw = payload.get("quantity")
+            if quantity_raw is None:
+                quantity_raw = payload.get("grammatura")
+            item_quantity = str(quantity_raw).strip() if quantity_raw is not None else ""
+
+            shopping_list.append(
+                {
+                    "name": item_name,
+                    "quantity": item_quantity,
+                    "isChecked": _coerce_bool(payload.get("isChecked"), default=False),
+                }
+            )
+
+        shopping_list.sort(key=lambda x: x["name"].lower())
+        return jsonify({"status": "success", "shoppingList": shopping_list}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/update_shopping_list', methods=['POST'])
+def update_shopping_list():
+    data = request.json or {}
+    uid = str(data.get("uid") or "").strip()
+
+    if not uid:
+        return jsonify({"error": "UID mancante"}), 400
+
+    raw_items = data.get("shoppingList")
+    if raw_items is None and isinstance(data.get("item"), dict):
+        raw_items = [data.get("item")]
+    if not isinstance(raw_items, list) or not raw_items:
+        return jsonify({"error": "shoppingList deve essere un array non vuoto"}), 400
+
+    replace = _coerce_bool(data.get("replace"), default=False)
+
+    normalized_items: List[Dict[str, Any]] = []
+    normalized_by_name: Dict[str, Dict[str, Any]] = {}
+    try:
+        for index, raw_item in enumerate(raw_items):
+            item = _normalize_shopping_item(raw_item, index=index)
+            key = _normalize_food_name(item["name"])
+            normalized_by_name[key] = item
+        normalized_items = list(normalized_by_name.values())
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    try:
+        user_ref = db.collection("users").document(uid)
+        user_doc = user_ref.get()
+        if not user_doc.exists:
+            return jsonify({"error": "Utente non trovato"}), 404
+
+        shopping_ref = _shopping_list_collection(uid)
+        batch = db.batch()
+
+        if replace:
+            existing_docs = list(shopping_ref.stream())
+            allowed_doc_ids = {item["name"] for item in normalized_items}
+            for doc in existing_docs:
+                if doc.id not in allowed_doc_ids:
+                    batch.delete(shopping_ref.document(doc.id))
+
+        for item in normalized_items:
+            doc_ref = shopping_ref.document(item["name"])
+            batch.set(
+                doc_ref,
+                {
+                    "name": item["name"],
+                    "grammatura": item["quantity"],
+                    "isChecked": item["isChecked"],
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+
+        batch.commit()
+
+        return jsonify(
+            {
+                "status": "success",
+                "updatedCount": len(normalized_items),
+                "replace": replace,
+            }
+        ), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
