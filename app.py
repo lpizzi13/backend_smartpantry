@@ -760,7 +760,7 @@ def update_shopping_list():
     raw_items = data.get("shoppingList")
     if raw_items is None and isinstance(data.get("item"), dict):
         raw_items = [data.get("item")]
-    if not isinstance(raw_items, list) or not raw_items:
+    if not isinstance(raw_items, list):
         return jsonify({"error": "shoppingList deve essere un array non vuoto"}), 400
 
     replace = _coerce_bool(data.get("replace"), default=False)
