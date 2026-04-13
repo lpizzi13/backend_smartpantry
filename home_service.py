@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import math
 import uuid
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from firebase_admin import firestore
 from google.api_core import exceptions as gcloud_exceptions
@@ -48,39 +48,34 @@ class HomeService:
             open_food_facts_id=open_food_facts_id,
             source=validated_source,
         )
-
         day_ref = self._day_doc_ref(validated_uid, validated_date_key)
-        target_entry_ref = day_ref.collection(validated_meal_type).document(resolved_id)
 
         def _tx(transaction: Any) -> Dict[str, Any]:
-            existing_matches = self._find_entries_by_id(
+            day_state = self._load_day_state(
                 day_ref=day_ref,
-                open_food_facts_id=resolved_id,
+                date_key=validated_date_key,
                 transaction=transaction,
             )
-            if len(existing_matches) > 1:
+            meals = self._clone_meals(day_state["meals"])
+            previous_totals = day_state["totals"]
+            previous_entries_count = day_state["entriesCount"]
+
+            matches = self._find_entry_occurrences(
+                meals=meals,
+                open_food_facts_id=resolved_id,
+            )
+            if len(matches) > 1:
                 raise HomeError(
                     "Dati Home incoerenti: entry duplicata su pasti multipli",
                     status_code=500,
                 )
 
-            existing_match = existing_matches[0] if existing_matches else None
-            existing_nutrients = (
-                existing_match["entry"]["nutrients"] if existing_match else None
-            )
-            existing_ref = existing_match["ref"] if existing_match else None
-            existing_meal = existing_match["mealType"] if existing_match else None
-
-            totals, entries_count = self._recalculate_day_state(
-                day_ref=day_ref,
-                transaction=transaction,
-            )
-
-            if existing_nutrients is None:
-                entries_count += 1
-            else:
-                totals = self._subtract_nutrients(totals, existing_nutrients)
-            totals = self._add_nutrients(totals, validated_nutrients)
+            insertion_index: Optional[int] = None
+            if matches:
+                current_meal, index = matches[0]
+                meals[current_meal].pop(index)
+                if current_meal == validated_meal_type:
+                    insertion_index = index
 
             entry_payload = {
                 "openFoodFactsId": resolved_id,
@@ -89,17 +84,22 @@ class HomeService:
                 "grams": validated_grams,
                 "nutrients": validated_nutrients,
             }
-            day_payload = self._build_day_payload(
-                date_key=validated_date_key,
-                totals=totals,
-                entries_count=entries_count,
-            )
 
-            if existing_ref is not None and existing_meal != validated_meal_type:
-                transaction.delete(existing_ref)
-            transaction.set(target_entry_ref, entry_payload)
-            transaction.set(day_ref, day_payload)
-            return day_payload
+            target_meal_entries = meals[validated_meal_type]
+            if insertion_index is not None and insertion_index <= len(target_meal_entries):
+                target_meal_entries.insert(insertion_index, entry_payload)
+            else:
+                target_meal_entries.append(entry_payload)
+
+            return self._persist_day_and_aggregates(
+                transaction=transaction,
+                uid=validated_uid,
+                date_key=validated_date_key,
+                day_ref=day_ref,
+                previous_totals=previous_totals,
+                previous_entries_count=previous_entries_count,
+                updated_meals=meals,
+            )
 
         day_payload = self._run_transaction(_tx)
         return {
@@ -112,35 +112,19 @@ class HomeService:
         validated_uid = self._validate_uid(uid)
         validated_date_key = self._validate_date_key(date_key)
         day_ref = self._day_doc_ref(validated_uid, validated_date_key)
-
-        day_snapshot = day_ref.get()
-        meals: Dict[str, List[Dict[str, Any]]] = {meal: [] for meal in MEAL_TYPES}
-        totals = self._zero_totals()
-        entries_count = 0
-
-        for meal in MEAL_TYPES:
-            docs = self._stream_entries(
-                entries_ref=day_ref.collection(meal),
-                transaction=None,
-            )
-            for doc in docs:
-                entry = self._parse_stored_entry(
-                    doc_id=getattr(doc, "id", ""),
-                    payload=doc.to_dict() or {},
-                    expected_meal_type=meal,
-                )
-                meals[meal].append(entry)
-                totals = self._add_nutrients(totals, entry["nutrients"])
-                entries_count += 1
-
-        if not day_snapshot.exists and entries_count == 0:
+        day_state = self._load_day_state(
+            day_ref=day_ref,
+            date_key=validated_date_key,
+            transaction=None,
+        )
+        if not day_state["exists"]:
             raise HomeError("Giorno non trovato", status_code=404)
 
         return {
             "dateKey": validated_date_key,
-            "totals": totals,
-            "entriesCount": entries_count,
-            "meals": meals,
+            "totals": day_state["totals"],
+            "entriesCount": day_state["entriesCount"],
+            "meals": day_state["meals"],
         }
 
     def patch_entry(
@@ -160,15 +144,21 @@ class HomeService:
         validated_meal_type = self._validate_meal_type(meal_type)
         validated_grams = self._validate_grams(grams)
         validated_nutrients = self._validate_nutrients(nutrients)
-
         day_ref = self._day_doc_ref(validated_uid, validated_date_key)
-        target_entry_ref = day_ref.collection(validated_meal_type).document(validated_id)
 
         def _tx(transaction: Any) -> Dict[str, Any]:
-            matches = self._find_entries_by_id(
+            day_state = self._load_day_state(
                 day_ref=day_ref,
-                open_food_facts_id=validated_id,
+                date_key=validated_date_key,
                 transaction=transaction,
+            )
+            meals = self._clone_meals(day_state["meals"])
+            previous_totals = day_state["totals"]
+            previous_entries_count = day_state["entriesCount"]
+
+            matches = self._find_entry_occurrences(
+                meals=meals,
+                open_food_facts_id=validated_id,
             )
             if not matches:
                 raise HomeError("Entry non trovata", status_code=404)
@@ -178,18 +168,8 @@ class HomeService:
                     status_code=500,
                 )
 
-            existing_match = matches[0]
-            existing_entry = existing_match["entry"]
-            existing_ref = existing_match["ref"]
-            existing_meal = existing_match["mealType"]
-
-            totals, entries_count = self._recalculate_day_state(
-                day_ref=day_ref,
-                transaction=transaction,
-            )
-            totals = self._subtract_nutrients(totals, existing_entry["nutrients"])
-            totals = self._add_nutrients(totals, validated_nutrients)
-
+            existing_meal, existing_index = matches[0]
+            existing_entry = meals[existing_meal].pop(existing_index)
             updated_payload = {
                 "openFoodFactsId": validated_id,
                 "source": existing_entry["source"],
@@ -197,17 +177,17 @@ class HomeService:
                 "grams": validated_grams,
                 "nutrients": validated_nutrients,
             }
-            day_payload = self._build_day_payload(
-                date_key=validated_date_key,
-                totals=totals,
-                entries_count=entries_count,
-            )
+            meals[validated_meal_type].append(updated_payload)
 
-            if existing_meal != validated_meal_type:
-                transaction.delete(existing_ref)
-            transaction.set(target_entry_ref, updated_payload)
-            transaction.set(day_ref, day_payload)
-            return day_payload
+            return self._persist_day_and_aggregates(
+                transaction=transaction,
+                uid=validated_uid,
+                date_key=validated_date_key,
+                day_ref=day_ref,
+                previous_totals=previous_totals,
+                previous_entries_count=previous_entries_count,
+                updated_meals=meals,
+            )
 
         day_payload = self._run_transaction(_tx)
         return {
@@ -224,14 +204,21 @@ class HomeService:
         validated_id = self._validate_open_food_facts_id(
             open_food_facts_id, required=True
         )
-
         day_ref = self._day_doc_ref(validated_uid, validated_date_key)
 
         def _tx(transaction: Any) -> Dict[str, Any]:
-            matches = self._find_entries_by_id(
+            day_state = self._load_day_state(
                 day_ref=day_ref,
-                open_food_facts_id=validated_id,
+                date_key=validated_date_key,
                 transaction=transaction,
+            )
+            meals = self._clone_meals(day_state["meals"])
+            previous_totals = day_state["totals"]
+            previous_entries_count = day_state["entriesCount"]
+
+            matches = self._find_entry_occurrences(
+                meals=meals,
+                open_food_facts_id=validated_id,
             )
             if not matches:
                 raise HomeError("Entry non trovata", status_code=404)
@@ -241,25 +228,18 @@ class HomeService:
                     status_code=500,
                 )
 
-            existing_match = matches[0]
-            existing_entry = existing_match["entry"]
-            existing_ref = existing_match["ref"]
+            meal_type_found, index = matches[0]
+            meals[meal_type_found].pop(index)
 
-            totals, entries_count = self._recalculate_day_state(
-                day_ref=day_ref,
+            return self._persist_day_and_aggregates(
                 transaction=transaction,
-            )
-            totals = self._subtract_nutrients(totals, existing_entry["nutrients"])
-            entries_count = max(entries_count - 1, 0)
-
-            day_payload = self._build_day_payload(
+                uid=validated_uid,
                 date_key=validated_date_key,
-                totals=totals,
-                entries_count=entries_count,
+                day_ref=day_ref,
+                previous_totals=previous_totals,
+                previous_entries_count=previous_entries_count,
+                updated_meals=meals,
             )
-            transaction.delete(existing_ref)
-            transaction.set(day_ref, day_payload)
-            return day_payload
 
         day_payload = self._run_transaction(_tx)
         return {
@@ -268,21 +248,150 @@ class HomeService:
             "entriesCount": day_payload["entriesCount"],
         }
 
-    def _find_entries_by_id(
-        self, day_ref: Any, open_food_facts_id: str, transaction: Any
-    ) -> List[Dict[str, Any]]:
-        matches: List[Dict[str, Any]] = []
-        for meal in MEAL_TYPES:
-            entry_ref = day_ref.collection(meal).document(open_food_facts_id)
-            snapshot = entry_ref.get(transaction=transaction)
-            if not snapshot.exists:
-                continue
-            parsed_entry = self._parse_stored_entry(
-                doc_id=open_food_facts_id,
-                payload=snapshot.to_dict() or {},
-                expected_meal_type=meal,
+    def _persist_day_and_aggregates(
+        self,
+        transaction: Any,
+        uid: str,
+        date_key: str,
+        day_ref: Any,
+        previous_totals: Dict[str, float],
+        previous_entries_count: int,
+        updated_meals: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        next_totals, next_entries_count = self._calculate_day_metrics(updated_meals)
+        previous_has_entries = previous_entries_count > 0
+        next_has_entries = next_entries_count > 0
+
+        delta_totals = self._diff_totals(previous_totals, next_totals)
+        delta_entries_count = int(next_entries_count) - int(previous_entries_count)
+        delta_days_count = int(next_has_entries) - int(previous_has_entries)
+
+        # Firestore richiede tutte le read prima delle write nella stessa transazione.
+        self._update_period_aggregates(
+            transaction=transaction,
+            uid=uid,
+            date_key=date_key,
+            delta_totals=delta_totals,
+            delta_entries_count=delta_entries_count,
+            delta_days_count=delta_days_count,
+        )
+
+        if next_has_entries:
+            day_payload = self._build_day_payload(
+                date_key=date_key,
+                meals=updated_meals,
+                totals=next_totals,
+                entries_count=next_entries_count,
             )
-            matches.append({"mealType": meal, "ref": entry_ref, "entry": parsed_entry})
+            transaction.set(day_ref, day_payload, merge=True)
+        else:
+            transaction.delete(day_ref)
+            day_payload = self._build_empty_day_payload(date_key=date_key)
+
+        return day_payload
+
+    def _update_period_aggregates(
+        self,
+        transaction: Any,
+        uid: str,
+        date_key: str,
+        delta_totals: Dict[str, float],
+        delta_entries_count: int,
+        delta_days_count: int,
+    ) -> None:
+        if (
+            self._is_zero_totals(delta_totals)
+            and delta_entries_count == 0
+            and delta_days_count == 0
+        ):
+            return
+
+        week_info = self._week_info(date_key)
+        weekly_ref = self._weekly_stats_doc_ref(uid, week_info["weekKey"])
+        weekly_snapshot = weekly_ref.get(transaction=transaction)
+
+        month_info = self._month_info(date_key)
+        monthly_ref = self._monthly_stats_doc_ref(uid, month_info["monthKey"])
+        monthly_snapshot = monthly_ref.get(transaction=transaction)
+
+        self._apply_aggregate_delta(
+            transaction=transaction,
+            doc_ref=weekly_ref,
+            snapshot=weekly_snapshot,
+            period_payload={
+                "weekKey": week_info["weekKey"],
+                "startDateKey": week_info["startDateKey"],
+                "endDateKey": week_info["endDateKey"],
+            },
+            delta_totals=delta_totals,
+            delta_entries_count=delta_entries_count,
+            delta_days_count=delta_days_count,
+        )
+        self._apply_aggregate_delta(
+            transaction=transaction,
+            doc_ref=monthly_ref,
+            snapshot=monthly_snapshot,
+            period_payload={
+                "monthKey": month_info["monthKey"],
+                "year": month_info["year"],
+                "month": month_info["month"],
+            },
+            delta_totals=delta_totals,
+            delta_entries_count=delta_entries_count,
+            delta_days_count=delta_days_count,
+        )
+
+    def _apply_aggregate_delta(
+        self,
+        transaction: Any,
+        doc_ref: Any,
+        snapshot: Any,
+        period_payload: Dict[str, Any],
+        delta_totals: Dict[str, float],
+        delta_entries_count: int,
+        delta_days_count: int,
+    ) -> None:
+        existing_payload = snapshot.to_dict() if snapshot.exists else {}
+        existing_totals = self._extract_totals(existing_payload.get("totals"))
+        existing_entries_count = self._coerce_int(existing_payload.get("entriesCount"))
+        existing_days_count = self._coerce_int(existing_payload.get("daysCount"))
+
+        updated_totals = self._add_totals(existing_totals, delta_totals)
+        updated_entries_count = max(existing_entries_count + int(delta_entries_count), 0)
+        updated_days_count = max(existing_days_count + int(delta_days_count), 0)
+
+        if (
+            updated_entries_count == 0
+            and updated_days_count == 0
+            and self._is_zero_totals(updated_totals)
+        ):
+            if snapshot.exists:
+                transaction.delete(doc_ref)
+            return
+
+        payload = {
+            **period_payload,
+            "totals": updated_totals,
+            "entriesCount": updated_entries_count,
+            "daysCount": updated_days_count,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        }
+        transaction.set(doc_ref, payload, merge=True)
+
+    def _find_entry_occurrences(
+        self, meals: Dict[str, List[Dict[str, Any]]], open_food_facts_id: str
+    ) -> List[Tuple[str, int]]:
+        matches: List[Tuple[str, int]] = []
+        for meal in MEAL_TYPES:
+            meal_entries = meals.get(meal, [])
+            for index, entry in enumerate(meal_entries):
+                entry_id = self._validate_open_food_facts_id(
+                    entry.get("openFoodFactsId"),
+                    required=True,
+                    status_code=500,
+                )
+                if entry_id == open_food_facts_id:
+                    matches.append((meal, index))
         return matches
 
     def _run_transaction(
@@ -325,23 +434,88 @@ class HomeService:
             except Exception:
                 return
 
-    def _recalculate_day_state(
+    def _load_day_state(
+        self, day_ref: Any, date_key: str, transaction: Any
+    ) -> Dict[str, Any]:
+        day_snapshot = day_ref.get(transaction=transaction)
+        day_exists = bool(day_snapshot.exists)
+        raw_payload = day_snapshot.to_dict() if day_exists else {}
+        if raw_payload is None:
+            raw_payload = {}
+
+        meals = self._parse_embedded_meals(raw_payload)
+        if meals is None:
+            meals = self._load_legacy_meals(day_ref=day_ref, transaction=transaction)
+
+        totals, entries_count = self._calculate_day_metrics(meals)
+        has_legacy_entries = entries_count > 0
+
+        return {
+            "exists": day_exists or has_legacy_entries,
+            "dateKey": date_key,
+            "meals": meals,
+            "totals": totals,
+            "entriesCount": entries_count,
+        }
+
+    def _parse_embedded_meals(
+        self, payload: Dict[str, Any]
+    ) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+        has_meal_field = any(meal in payload for meal in MEAL_TYPES)
+        if not has_meal_field:
+            return None
+
+        meals: Dict[str, List[Dict[str, Any]]] = self._empty_meals()
+        for meal in MEAL_TYPES:
+            raw_entries = payload.get(meal, [])
+            if raw_entries is None:
+                raw_entries = []
+            if not isinstance(raw_entries, list):
+                raise HomeError(
+                    f"Dati Home incoerenti: campo {meal} non valido",
+                    status_code=500,
+                )
+            for item in raw_entries:
+                if not isinstance(item, dict):
+                    raise HomeError(
+                        f"Dati Home incoerenti: entry non valida in {meal}",
+                        status_code=500,
+                    )
+                parsed = self._parse_stored_entry(
+                    doc_id=str(item.get("openFoodFactsId") or ""),
+                    payload=item,
+                    expected_meal_type=meal,
+                )
+                meals[meal].append(parsed)
+        return meals
+
+    def _load_legacy_meals(
         self, day_ref: Any, transaction: Any
-    ) -> Tuple[Dict[str, float], int]:
-        totals = self._zero_totals()
-        entries_count = 0
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        meals: Dict[str, List[Dict[str, Any]]] = self._empty_meals()
         for meal in MEAL_TYPES:
             docs = self._stream_entries(
                 entries_ref=day_ref.collection(meal),
                 transaction=transaction,
             )
             for doc in docs:
-                entry = self._parse_stored_entry(
+                parsed_entry = self._parse_stored_entry(
                     doc_id=getattr(doc, "id", ""),
                     payload=doc.to_dict() or {},
                     expected_meal_type=meal,
                 )
-                totals = self._add_nutrients(totals, entry["nutrients"])
+                meals[meal].append(parsed_entry)
+        return meals
+
+    def _calculate_day_metrics(
+        self, meals: Dict[str, List[Dict[str, Any]]]
+    ) -> Tuple[Dict[str, float], int]:
+        totals = self._zero_totals()
+        entries_count = 0
+        for meal in MEAL_TYPES:
+            meal_entries = meals.get(meal, [])
+            for entry in meal_entries:
+                totals = self._add_totals(totals, entry["nutrients"])
                 entries_count += 1
         return totals, entries_count
 
@@ -380,22 +554,30 @@ class HomeService:
             "nutrients": nutrients,
         }
 
-    @staticmethod
-    def _zero_totals() -> Dict[str, float]:
-        return {"kcal": 0.0, "carbs": 0.0, "protein": 0.0, "fat": 0.0}
-
     def _build_day_payload(
-        self, date_key: str, totals: Dict[str, float], entries_count: int
+        self,
+        date_key: str,
+        meals: Dict[str, List[Dict[str, Any]]],
+        totals: Dict[str, float],
+        entries_count: int,
     ) -> Dict[str, Any]:
+        normalized_meals = self._clone_meals(meals)
         return {
             "dateKey": date_key,
-            "totals": {
-                "kcal": round(float(totals["kcal"]), 3),
-                "carbs": round(float(totals["carbs"]), 3),
-                "protein": round(float(totals["protein"]), 3),
-                "fat": round(float(totals["fat"]), 3),
-            },
             "entriesCount": int(entries_count),
+            "totals": self._normalize_totals(totals),
+            "breakfast": normalized_meals["breakfast"],
+            "lunch": normalized_meals["lunch"],
+            "dinner": normalized_meals["dinner"],
+            "snacks": normalized_meals["snacks"],
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        }
+
+    def _build_empty_day_payload(self, date_key: str) -> Dict[str, Any]:
+        return {
+            "dateKey": date_key,
+            "entriesCount": 0,
+            "totals": self._zero_totals(),
         }
 
     def _resolve_add_entry_id(self, open_food_facts_id: Any, source: str) -> str:
@@ -414,6 +596,140 @@ class HomeService:
         return self._db.collection("users").document(uid).collection("home").document(
             date_key
         )
+
+    def _weekly_stats_doc_ref(self, uid: str, week_key: str) -> Any:
+        return (
+            self._db.collection("users")
+            .document(uid)
+            .collection("weeklyStats")
+            .document(week_key)
+        )
+
+    def _monthly_stats_doc_ref(self, uid: str, month_key: str) -> Any:
+        return (
+            self._db.collection("users")
+            .document(uid)
+            .collection("monthlyStats")
+            .document(month_key)
+        )
+
+    @staticmethod
+    def _week_info(date_key: str) -> Dict[str, str]:
+        current_date = datetime.strptime(date_key, "%Y-%m-%d").date()
+        iso_calendar = current_date.isocalendar()
+        week_key = f"{iso_calendar.year}-W{iso_calendar.week:02d}"
+        start_date = current_date - timedelta(days=current_date.weekday())
+        end_date = start_date + timedelta(days=6)
+        return {
+            "weekKey": week_key,
+            "startDateKey": start_date.strftime("%Y-%m-%d"),
+            "endDateKey": end_date.strftime("%Y-%m-%d"),
+        }
+
+    @staticmethod
+    def _month_info(date_key: str) -> Dict[str, Any]:
+        current_date = datetime.strptime(date_key, "%Y-%m-%d").date()
+        return {
+            "monthKey": current_date.strftime("%Y-%m"),
+            "year": current_date.year,
+            "month": current_date.month,
+        }
+
+    @staticmethod
+    def _empty_meals() -> Dict[str, List[Dict[str, Any]]]:
+        return {meal: [] for meal in MEAL_TYPES}
+
+    def _clone_meals(
+        self, meals: Dict[str, List[Dict[str, Any]]]
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        cloned: Dict[str, List[Dict[str, Any]]] = self._empty_meals()
+        for meal in MEAL_TYPES:
+            for entry in meals.get(meal, []):
+                cloned[meal].append(
+                    {
+                        "openFoodFactsId": entry["openFoodFactsId"],
+                        "source": entry["source"],
+                        "productName": entry["productName"],
+                        "grams": float(entry["grams"]),
+                        "nutrients": self._normalize_totals(entry["nutrients"]),
+                    }
+                )
+        return cloned
+
+    @staticmethod
+    def _normalize_totals(totals: Dict[str, Any]) -> Dict[str, float]:
+        normalized: Dict[str, float] = {}
+        for key in NUTRIENT_KEYS:
+            value = float(totals.get(key, 0.0))
+            if abs(value) < 1e-9:
+                value = 0.0
+            normalized[key] = round(max(value, 0.0), 3)
+        return normalized
+
+    @staticmethod
+    def _extract_totals(raw_totals: Any) -> Dict[str, float]:
+        if not isinstance(raw_totals, dict):
+            return {"kcal": 0.0, "carbs": 0.0, "protein": 0.0, "fat": 0.0}
+        parsed: Dict[str, float] = {}
+        for key in NUTRIENT_KEYS:
+            raw_value = raw_totals.get(key, 0.0)
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                value = 0.0
+            if not math.isfinite(value):
+                value = 0.0
+            if abs(value) < 1e-9:
+                value = 0.0
+            parsed[key] = round(max(value, 0.0), 3)
+        return parsed
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int:
+        if value is None or isinstance(value, bool):
+            return 0
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return max(parsed, 0)
+
+    @staticmethod
+    def _diff_totals(
+        previous_totals: Dict[str, float], next_totals: Dict[str, float]
+    ) -> Dict[str, float]:
+        diff: Dict[str, float] = {}
+        for key in NUTRIENT_KEYS:
+            value = float(next_totals.get(key, 0.0)) - float(
+                previous_totals.get(key, 0.0)
+            )
+            if abs(value) < 1e-9:
+                value = 0.0
+            diff[key] = round(value, 3)
+        return diff
+
+    @staticmethod
+    def _add_totals(
+        totals: Dict[str, float], delta: Dict[str, float]
+    ) -> Dict[str, float]:
+        merged = dict(totals)
+        for key in NUTRIENT_KEYS:
+            value = float(merged.get(key, 0.0)) + float(delta.get(key, 0.0))
+            if abs(value) < 1e-9:
+                value = 0.0
+            merged[key] = round(max(value, 0.0), 3)
+        return merged
+
+    @staticmethod
+    def _is_zero_totals(totals: Dict[str, float]) -> bool:
+        for key in NUTRIENT_KEYS:
+            if abs(float(totals.get(key, 0.0))) >= 1e-9:
+                return False
+        return True
+
+    @staticmethod
+    def _zero_totals() -> Dict[str, float]:
+        return {"kcal": 0.0, "carbs": 0.0, "protein": 0.0, "fat": 0.0}
 
     @staticmethod
     def _validate_uid(uid: Any) -> str:
@@ -480,7 +796,9 @@ class HomeService:
     @staticmethod
     def _validate_product_name(product_name: Any, status_code: int = 400) -> str:
         if not isinstance(product_name, str):
-            raise HomeError("productName deve essere una stringa", status_code=status_code)
+            raise HomeError(
+                "productName deve essere una stringa", status_code=status_code
+            )
         return product_name.strip()
 
     @staticmethod
@@ -523,26 +841,3 @@ class HomeService:
                 )
             parsed[key] = round(value, 3)
         return parsed
-
-    @staticmethod
-    def _add_nutrients(
-        totals: Dict[str, float], nutrients: Dict[str, float]
-    ) -> Dict[str, float]:
-        merged = dict(totals)
-        for key in NUTRIENT_KEYS:
-            merged[key] = round(
-                float(merged.get(key, 0.0)) + float(nutrients.get(key, 0.0)), 3
-            )
-        return merged
-
-    @staticmethod
-    def _subtract_nutrients(
-        totals: Dict[str, float], nutrients: Dict[str, float]
-    ) -> Dict[str, float]:
-        merged = dict(totals)
-        for key in NUTRIENT_KEYS:
-            value = float(merged.get(key, 0.0)) - float(nutrients.get(key, 0.0))
-            if abs(value) < 1e-9:
-                value = 0.0
-            merged[key] = round(max(value, 0.0), 3)
-        return merged

@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, firestore, auth
+from datetime import datetime, timedelta, date
 from home_routes import create_home_blueprint
 from pantries_routes import create_pantries_blueprint
 
@@ -411,6 +412,184 @@ def delete_diet():
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/get-stats', methods=['POST'])
+def get_stats():
+    data = request.get_json(silent=True) or {}
+    uid = data.get('uid')
+    # Backward compatibility: support multiple key names and default to today.
+    reference_date = (
+        data.get('referenceDate')
+        or data.get('reference_date')
+        or data.get('selectedDate')
+        or data.get('date')
+    )
+
+    if not uid:
+        return jsonify({"status": "error", "error": "UID mancante"}), 400
+
+    if reference_date:
+        try:
+            parsed_reference_date = datetime.strptime(
+                str(reference_date).strip(), "%Y-%m-%d"
+            ).date()
+        except Exception:
+            return jsonify({
+                "status": "error",
+                "error": "referenceDate non valida (atteso formato YYYY-MM-DD)"
+            }), 400
+    else:
+        parsed_reference_date = datetime.now().date()
+
+    try:
+        user_ref = db.collection('users').document(uid)
+        home_ref = user_ref.collection('home')
+        monthly_ref = user_ref.collection('monthlyStats')
+
+        weekly_stats = []
+        week_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        week_start = parsed_reference_date - timedelta(days=parsed_reference_date.weekday())
+        for day_index in range(7):
+            day_date = week_start + timedelta(days=day_index)
+            day_key = day_date.strftime("%Y-%m-%d")
+            day_doc = home_ref.document(day_key).get()
+            day_data = day_doc.to_dict() if day_doc.exists else {}
+            totals = day_data.get("totals") if isinstance(day_data.get("totals"), dict) else {}
+
+            try:
+                kcal = float(totals.get("kcal", 0) or 0)
+            except Exception:
+                kcal = 0.0
+            try:
+                proteins = float(totals.get("protein", 0) or 0)
+            except Exception:
+                proteins = 0.0
+            try:
+                carbs = float(totals.get("carbs", 0) or 0)
+            except Exception:
+                carbs = 0.0
+            try:
+                fats = float(totals.get("fat", 0) or 0)
+            except Exception:
+                fats = 0.0
+
+            weekly_stats.append({
+                "date": week_labels[day_index],
+                "kcal": round(max(kcal, 0.0), 3),
+                "proteins": round(max(proteins, 0.0), 3),
+                "carbs": round(max(carbs, 0.0), 3),
+                "fats": round(max(fats, 0.0), 3),
+            })
+
+        monthly_stats = []
+        first_day_of_month = parsed_reference_date.replace(day=1)
+        if first_day_of_month.month == 12:
+            first_day_next_month = date(first_day_of_month.year + 1, 1, 1)
+        else:
+            first_day_next_month = date(first_day_of_month.year, first_day_of_month.month + 1, 1)
+        last_day_of_month = first_day_next_month - timedelta(days=1)
+
+        iter_week_start = first_day_of_month - timedelta(days=first_day_of_month.weekday())
+        last_week_start = last_day_of_month - timedelta(days=last_day_of_month.weekday())
+        week_number = 1
+        while iter_week_start <= last_week_start:
+            iter_week_end = iter_week_start + timedelta(days=6)
+
+            week_kcal_sum = 0.0
+            week_proteins_sum = 0.0
+            week_carbs_sum = 0.0
+            week_fats_sum = 0.0
+
+            for day_offset in range(7):
+                day_date = iter_week_start + timedelta(days=day_offset)
+                day_key = day_date.strftime("%Y-%m-%d")
+                day_doc = home_ref.document(day_key).get()
+                day_data = day_doc.to_dict() if day_doc.exists else {}
+                totals = day_data.get("totals") if isinstance(day_data.get("totals"), dict) else {}
+
+                try:
+                    day_kcal = float(totals.get("kcal", 0) or 0)
+                except Exception:
+                    day_kcal = 0.0
+                try:
+                    day_proteins = float(totals.get("protein", 0) or 0)
+                except Exception:
+                    day_proteins = 0.0
+                try:
+                    day_carbs = float(totals.get("carbs", 0) or 0)
+                except Exception:
+                    day_carbs = 0.0
+                try:
+                    day_fats = float(totals.get("fat", 0) or 0)
+                except Exception:
+                    day_fats = 0.0
+
+                week_kcal_sum += max(day_kcal, 0.0)
+                week_proteins_sum += max(day_proteins, 0.0)
+                week_carbs_sum += max(day_carbs, 0.0)
+                week_fats_sum += max(day_fats, 0.0)
+
+            # Weekly values are daily averages over the 7 days of the week.
+            kcal = week_kcal_sum / 7.0
+            proteins = week_proteins_sum / 7.0
+            carbs = week_carbs_sum / 7.0
+            fats = week_fats_sum / 7.0
+
+            monthly_stats.append({
+                "week": f"Week {week_number}",
+                "startDate": iter_week_start.strftime("%Y-%m-%d"),
+                "endDate": iter_week_end.strftime("%Y-%m-%d"),
+                "kcal": round(max(kcal, 0.0), 3),
+                "proteins": round(max(proteins, 0.0), 3),
+                "carbs": round(max(carbs, 0.0), 3),
+                "fats": round(max(fats, 0.0), 3),
+            })
+
+            iter_week_start = iter_week_start + timedelta(days=7)
+            week_number += 1
+
+        yearly_stats = []
+        month_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        selected_year = parsed_reference_date.year
+        for month_index in range(1, 13):
+            month_id = f"{selected_year}-{month_index:02d}"
+            month_doc = monthly_ref.document(month_id).get()
+            month_data = month_doc.to_dict() if month_doc.exists else {}
+            month_totals = month_data.get("totals") if isinstance(month_data.get("totals"), dict) else {}
+
+            try:
+                kcal = float(month_totals.get("kcal", 0) or 0)
+            except Exception:
+                kcal = 0.0
+            try:
+                proteins = float(month_totals.get("protein", 0) or 0)
+            except Exception:
+                proteins = 0.0
+            try:
+                carbs = float(month_totals.get("carbs", 0) or 0)
+            except Exception:
+                carbs = 0.0
+            try:
+                fats = float(month_totals.get("fat", 0) or 0)
+            except Exception:
+                fats = 0.0
+
+            yearly_stats.append({
+                "month": month_labels[month_index - 1],
+                "kcal": round(max(kcal, 0.0), 3),
+                "proteins": round(max(proteins, 0.0), 3),
+                "carbs": round(max(carbs, 0.0), 3),
+                "fats": round(max(fats, 0.0), 3),
+            })
+
+        return jsonify({
+            "status": "success",
+            "weeklyStats": weekly_stats,
+            "monthlyStats": monthly_stats,
+            "yearlyStats": yearly_stats
+        }), 200
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=True)
