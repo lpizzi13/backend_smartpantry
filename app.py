@@ -444,6 +444,7 @@ def get_stats():
     try:
         user_ref = db.collection('users').document(uid)
         home_ref = user_ref.collection('home')
+        weekly_ref = user_ref.collection('weeklyStats')
         monthly_ref = user_ref.collection('monthlyStats')
 
         weekly_stats = []
@@ -494,46 +495,49 @@ def get_stats():
         week_number = 1
         while iter_week_start <= last_week_start:
             iter_week_end = iter_week_start + timedelta(days=6)
+            iso_info = iter_week_start.isocalendar()
+            week_id = f"{iso_info.year}-W{iso_info.week:02d}"
+            week_doc = weekly_ref.document(week_id).get()
+            week_data = week_doc.to_dict() if week_doc.exists else {}
 
-            week_kcal_sum = 0.0
-            week_proteins_sum = 0.0
-            week_carbs_sum = 0.0
-            week_fats_sum = 0.0
+            daily_averages = week_data.get("dailyAverages") if isinstance(week_data.get("dailyAverages"), dict) else {}
+            totals = week_data.get("totals") if isinstance(week_data.get("totals"), dict) else {}
 
-            for day_offset in range(7):
-                day_date = iter_week_start + timedelta(days=day_offset)
-                day_key = day_date.strftime("%Y-%m-%d")
-                day_doc = home_ref.document(day_key).get()
-                day_data = day_doc.to_dict() if day_doc.exists else {}
-                totals = day_data.get("totals") if isinstance(day_data.get("totals"), dict) else {}
+            try:
+                kcal = float(daily_averages.get("kcal", 0) or 0)
+            except Exception:
+                kcal = 0.0
+            try:
+                proteins = float(daily_averages.get("protein", 0) or 0)
+            except Exception:
+                proteins = 0.0
+            try:
+                carbs = float(daily_averages.get("carbs", 0) or 0)
+            except Exception:
+                carbs = 0.0
+            try:
+                fats = float(daily_averages.get("fat", 0) or 0)
+            except Exception:
+                fats = 0.0
 
+            # Fallback per documenti storici senza dailyAverages.
+            if not daily_averages:
                 try:
-                    day_kcal = float(totals.get("kcal", 0) or 0)
+                    kcal = float(totals.get("kcal", 0) or 0) / 7.0
                 except Exception:
-                    day_kcal = 0.0
+                    kcal = 0.0
                 try:
-                    day_proteins = float(totals.get("protein", 0) or 0)
+                    proteins = float(totals.get("protein", 0) or 0) / 7.0
                 except Exception:
-                    day_proteins = 0.0
+                    proteins = 0.0
                 try:
-                    day_carbs = float(totals.get("carbs", 0) or 0)
+                    carbs = float(totals.get("carbs", 0) or 0) / 7.0
                 except Exception:
-                    day_carbs = 0.0
+                    carbs = 0.0
                 try:
-                    day_fats = float(totals.get("fat", 0) or 0)
+                    fats = float(totals.get("fat", 0) or 0) / 7.0
                 except Exception:
-                    day_fats = 0.0
-
-                week_kcal_sum += max(day_kcal, 0.0)
-                week_proteins_sum += max(day_proteins, 0.0)
-                week_carbs_sum += max(day_carbs, 0.0)
-                week_fats_sum += max(day_fats, 0.0)
-
-            # Weekly values are daily averages over the 7 days of the week.
-            kcal = week_kcal_sum / 7.0
-            proteins = week_proteins_sum / 7.0
-            carbs = week_carbs_sum / 7.0
-            fats = week_fats_sum / 7.0
+                    fats = 0.0
 
             monthly_stats.append({
                 "week": f"Week {week_number}",
@@ -555,24 +559,52 @@ def get_stats():
             month_id = f"{selected_year}-{month_index:02d}"
             month_doc = monthly_ref.document(month_id).get()
             month_data = month_doc.to_dict() if month_doc.exists else {}
-            month_totals = month_data.get("totals") if isinstance(month_data.get("totals"), dict) else {}
+
+            daily_averages = month_data.get("dailyAverages") if isinstance(month_data.get("dailyAverages"), dict) else {}
+            totals = month_data.get("totals") if isinstance(month_data.get("totals"), dict) else {}
 
             try:
-                kcal = float(month_totals.get("kcal", 0) or 0)
+                kcal = float(daily_averages.get("kcal", 0) or 0)
             except Exception:
                 kcal = 0.0
             try:
-                proteins = float(month_totals.get("protein", 0) or 0)
+                proteins = float(daily_averages.get("protein", 0) or 0)
             except Exception:
                 proteins = 0.0
             try:
-                carbs = float(month_totals.get("carbs", 0) or 0)
+                carbs = float(daily_averages.get("carbs", 0) or 0)
             except Exception:
                 carbs = 0.0
             try:
-                fats = float(month_totals.get("fat", 0) or 0)
+                fats = float(daily_averages.get("fat", 0) or 0)
             except Exception:
                 fats = 0.0
+
+            # Fallback per documenti storici senza dailyAverages.
+            if not daily_averages:
+                month_start = date(selected_year, month_index, 1)
+                if month_index == 12:
+                    next_month_start = date(selected_year + 1, 1, 1)
+                else:
+                    next_month_start = date(selected_year, month_index + 1, 1)
+                days_in_month = max((next_month_start - month_start).days, 1)
+
+                try:
+                    kcal = float(totals.get("kcal", 0) or 0) / float(days_in_month)
+                except Exception:
+                    kcal = 0.0
+                try:
+                    proteins = float(totals.get("protein", 0) or 0) / float(days_in_month)
+                except Exception:
+                    proteins = 0.0
+                try:
+                    carbs = float(totals.get("carbs", 0) or 0) / float(days_in_month)
+                except Exception:
+                    carbs = 0.0
+                try:
+                    fats = float(totals.get("fat", 0) or 0) / float(days_in_month)
+                except Exception:
+                    fats = 0.0
 
             yearly_stats.append({
                 "month": month_labels[month_index - 1],

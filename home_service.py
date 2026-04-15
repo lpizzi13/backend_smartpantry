@@ -372,6 +372,9 @@ class HomeService:
         payload = {
             **period_payload,
             "totals": updated_totals,
+            "dailyAverages": self._compute_period_daily_averages(
+                totals=updated_totals, period_payload=period_payload
+            ),
             "entriesCount": updated_entries_count,
             "daysCount": updated_days_count,
             "updatedAt": firestore.SERVER_TIMESTAMP,
@@ -730,6 +733,39 @@ class HomeService:
     @staticmethod
     def _zero_totals() -> Dict[str, float]:
         return {"kcal": 0.0, "carbs": 0.0, "protein": 0.0, "fat": 0.0}
+
+    def _compute_period_daily_averages(
+        self, totals: Dict[str, float], period_payload: Dict[str, Any]
+    ) -> Dict[str, float]:
+        period_days = self._resolve_period_days(period_payload)
+        averages: Dict[str, float] = {}
+        for key in NUTRIENT_KEYS:
+            value = float(totals.get(key, 0.0)) / float(period_days)
+            if abs(value) < 1e-9:
+                value = 0.0
+            averages[key] = round(max(value, 0.0), 3)
+        return averages
+
+    @staticmethod
+    def _resolve_period_days(period_payload: Dict[str, Any]) -> int:
+        if "weekKey" in period_payload:
+            return 7
+
+        raw_year = period_payload.get("year")
+        raw_month = period_payload.get("month")
+        try:
+            year = int(raw_year)
+            month = int(raw_month)
+            if month < 1 or month > 12:
+                raise ValueError
+            month_start = datetime(year, month, 1).date()
+            if month == 12:
+                next_month_start = datetime(year + 1, 1, 1).date()
+            else:
+                next_month_start = datetime(year, month + 1, 1).date()
+            return max((next_month_start - month_start).days, 1)
+        except (TypeError, ValueError):
+            return 30
 
     @staticmethod
     def _validate_uid(uid: Any) -> str:
