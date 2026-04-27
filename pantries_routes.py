@@ -107,7 +107,6 @@ def create_pantries_blueprint(db: Any) -> Blueprint:
             return _handle_error(exc)
 
     @pantries_bp.route("/pantry/grams", methods=["PATCH"])
-    @pantries_bp.route("/pantry/quantity", methods=["PATCH"])
     def set_item_grams() -> Tuple[Any, int]:
         payload = _get_json_payload()
         endpoint = request.path
