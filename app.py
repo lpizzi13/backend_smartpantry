@@ -1,9 +1,12 @@
+import json
 import math
+import os
 import re
 import unicodedata
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
 from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, firestore, auth
@@ -294,6 +297,254 @@ def _normalize_shopping_item(raw_item: Any, index: int = 0) -> Dict[str, Any]:
         "quantity": quantity,
         "isChecked": _coerce_bool(raw_item.get("isChecked"), default=False),
     }
+
+
+def _coerce_coordinate(value: Any, field_name: str, min_value: float, max_value: float) -> float:
+    if value is None or isinstance(value, bool):
+        raise ValueError(f"{field_name} mancante")
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} non valido") from None
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} non valido")
+    if parsed < min_value or parsed > max_value:
+        raise ValueError(f"{field_name} fuori range")
+    return parsed
+
+
+def _coerce_radius(value: Any) -> int:
+    if value is None:
+        return 5000
+    if isinstance(value, bool):
+        raise ValueError("radius non valido")
+    try:
+        parsed = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        raise ValueError("radius non valido") from None
+    if parsed <= 0:
+        raise ValueError("radius deve essere > 0")
+    return min(parsed, 50000)
+
+
+def _haversine_distance_meters(
+    start_lat: float, start_lon: float, end_lat: float, end_lon: float
+) -> float:
+    radius_earth = 6371000.0
+    lat1 = math.radians(start_lat)
+    lon1 = math.radians(start_lon)
+    lat2 = math.radians(end_lat)
+    lon2 = math.radians(end_lon)
+    delta_lat = lat2 - lat1
+    delta_lon = lon2 - lon1
+    a = (
+        math.sin(delta_lat / 2.0) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2.0) ** 2
+    )
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    return round(radius_earth * c, 3)
+
+
+def _extract_place_id(place_payload: Dict[str, Any]) -> str:
+    place_id = str(place_payload.get("id") or "").strip()
+    if place_id:
+        return place_id
+    resource_name = str(place_payload.get("name") or "").strip()
+    if resource_name.startswith("places/"):
+        return resource_name.split("/", 1)[1]
+    return resource_name
+
+
+def _load_google_places_api_key() -> str:
+    local_key_paths = ("mapsApiKey.json", "mapsApiKey.local.json")
+    candidate_fields = (
+        "googlePlacesApiKey",
+        "google_places_api_key",
+        "GOOGLE_PLACES_API_KEY",
+        "apiKey",
+        "key",
+    )
+
+    for key_path in local_key_paths:
+        if not os.path.isfile(key_path):
+            continue
+        try:
+            with open(key_path, "r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        for field_name in candidate_fields:
+            raw_value = payload.get(field_name)
+            value = str(raw_value).strip() if raw_value is not None else ""
+            if value:
+                return value
+
+    return (
+        os.getenv("GOOGLE_PLACES_API_KEY", "").strip()
+        or os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+        or os.getenv("MAPS_API_KEY", "").strip()
+    )
+
+
+@app.route('/nearby-supermarkets', methods=['POST'])
+def nearby_supermarkets():
+    data = request.get_json(silent=True) or {}
+
+    try:
+        latitude = _coerce_coordinate(
+            value=data.get("latitude"),
+            field_name="latitude",
+            min_value=-90.0,
+            max_value=90.0,
+        )
+        longitude = _coerce_coordinate(
+            value=data.get("longitude"),
+            field_name="longitude",
+            min_value=-180.0,
+            max_value=180.0,
+        )
+        radius = _coerce_radius(data.get("radius", 5000))
+    except ValueError as exc:
+        return jsonify({"status": "error", "results": [], "error": str(exc)}), 400
+
+    api_key = _load_google_places_api_key()
+    if not api_key:
+        return jsonify({
+            "status": "error",
+            "results": [],
+            "error": (
+                "Google Places API key mancante. "
+                "Aggiungi mapsApiKey.json o configura GOOGLE_PLACES_API_KEY."
+            ),
+        }), 500
+
+    payload = {
+        "includedTypes": ["supermarket"],
+        "maxResultCount": 20,
+        "rankPreference": "DISTANCE",
+        "locationRestriction": {
+            "circle": {
+                "center": {
+                    "latitude": latitude,
+                    "longitude": longitude,
+                },
+                "radius": float(radius),
+            }
+        },
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": api_key,
+        "X-Goog-FieldMask": (
+            "places.id,places.name,places.displayName,places.formattedAddress,"
+            "places.location,places.rating,places.userRatingCount,"
+            "places.currentOpeningHours.openNow"
+        ),
+    }
+
+    try:
+        response = requests.post(
+            "https://places.googleapis.com/v1/places:searchNearby",
+            json=payload,
+            headers=headers,
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "status": "error",
+            "results": [],
+            "error": f"Errore rete Places API: {str(exc)}",
+        }), 502
+
+    if response.status_code >= 400:
+        api_error = ""
+        try:
+            api_error = (response.json().get("error") or {}).get("message", "")
+        except Exception:
+            api_error = response.text.strip()
+        api_error = api_error or f"Places API HTTP {response.status_code}"
+        return jsonify({"status": "error", "results": [], "error": api_error}), 502
+
+    try:
+        places_payload = response.json()
+    except ValueError:
+        return jsonify({
+            "status": "error",
+            "results": [],
+            "error": "Risposta Places API non valida",
+        }), 502
+
+    places = places_payload.get("places")
+    if not isinstance(places, list):
+        places = []
+
+    results: List[Dict[str, Any]] = []
+    for place in places:
+        if not isinstance(place, dict):
+            continue
+
+        location = place.get("location")
+        if not isinstance(location, dict):
+            continue
+
+        try:
+            place_lat = float(location.get("latitude"))
+            place_lon = float(location.get("longitude"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(place_lat) or not math.isfinite(place_lon):
+            continue
+
+        place_id = _extract_place_id(place)
+        if not place_id:
+            continue
+
+        display_name = place.get("displayName")
+        name_text = ""
+        if isinstance(display_name, dict):
+            name_text = str(display_name.get("text") or "").strip()
+
+        rating_value = place.get("rating")
+        rating: Optional[float] = None
+        if isinstance(rating_value, (int, float)) and math.isfinite(float(rating_value)):
+            rating = float(rating_value)
+
+        rating_count_value = place.get("userRatingCount")
+        user_ratings_total: Optional[int] = None
+        if isinstance(rating_count_value, (int, float)) and not isinstance(rating_count_value, bool):
+            user_ratings_total = int(rating_count_value)
+
+        current_opening_hours = place.get("currentOpeningHours")
+        open_now: Optional[bool] = None
+        if isinstance(current_opening_hours, dict):
+            open_now_raw = current_opening_hours.get("openNow")
+            if isinstance(open_now_raw, bool):
+                open_now = open_now_raw
+
+        results.append(
+            {
+                "id": place_id,
+                "name": name_text or "Supermarket",
+                "address": str(place.get("formattedAddress") or "").strip(),
+                "latitude": round(place_lat, 7),
+                "longitude": round(place_lon, 7),
+                "distance": _haversine_distance_meters(
+                    start_lat=latitude,
+                    start_lon=longitude,
+                    end_lat=place_lat,
+                    end_lon=place_lon,
+                ),
+                "rating": rating,
+                "userRatingsTotal": user_ratings_total,
+                "openNow": open_now,
+            }
+        )
+
+    results.sort(key=lambda place: float(place.get("distance", 0.0)))
+    return jsonify({"status": "success", "results": results}), 200
 
 @app.route('/get-user-data', methods=['POST'])
 def get_user_data():

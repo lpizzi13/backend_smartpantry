@@ -367,7 +367,10 @@ def create_day_entries(
 
 def get_day_or_none(home_service: HomeService, uid: str, day_key: str) -> Dict[str, Any] | None:
     try:
-        return home_service.get_day(uid=uid, date_key=day_key)
+        day_data = home_service.get_day(uid=uid, date_key=day_key)
+        if int(day_data.get("entriesCount", 0) or 0) <= 0:
+            return None
+        return day_data
     except HomeError as exc:
         if exc.status_code == 404:
             return None

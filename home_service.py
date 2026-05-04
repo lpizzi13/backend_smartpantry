@@ -117,8 +117,6 @@ class HomeService:
             date_key=validated_date_key,
             transaction=None,
         )
-        if not day_state["exists"]:
-            raise HomeError("Giorno non trovato", status_code=404)
 
         return {
             "dateKey": validated_date_key,
